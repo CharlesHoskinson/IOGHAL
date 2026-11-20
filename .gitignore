@@ -1,0 +1,27 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+.pytest_cache/
+
+# Frontend
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+
+# Local audio references, generated outputs, raw captures, and scratch state
+voices/*.wav
+voices/*.mp3
+voices/*.flac
+voices/*.txt
+voices/raw/
+outputs/
+lore/raw/
+lore/hal9000_movie_lines.md
+audit/
+.checkpoint/
+.DS_Store
