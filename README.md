@@ -265,6 +265,9 @@ IOGHAL/
 │   ├── tts.py                  # VoxCPM2 HalVoiceEngine with prompt cache and phrase cache
 │   ├── server.py               # FastAPI HalRuntime, create_hal_router(), WebSocket server
 │   └── app.py                  # PyQt6 desktop GUI and terminal CLI application
+├── specs/
+│   ├── ioghal_protocol.qnt     # Executable Quint state-machine spec (multi-tab PTT & WS protocol)
+│   └── ioghal_protocol_test.qnt# Deterministic Quint protocol scenario tests
 ├── tests/
 │   └── test_hal9000.py         # Unit, protocol, framing, and concurrency test suite
 ├── voices/
@@ -285,12 +288,15 @@ IOGHAL/
 
 ## Verification
 
-Run the Python test suite, linter, and TypeScript production build:
+Run the Python test suite, linter, TypeScript production build, and Quint protocol checks:
 
 ```bash
 uv run python -m unittest discover -s tests -v
 uv run ruff check src tests test_clone.py
-cd web && npm run build
+cd web && npm run build && cd ..
+quint test specs/ioghal_protocol_test.qnt --main=ioghal_protocol_test
+quint run specs/ioghal_protocol.qnt --main=ioghal_protocol \
+  --invariant=allInvariants --max-samples=10000 --max-steps=50
 ```
 
 ---

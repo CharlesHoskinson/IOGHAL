@@ -365,7 +365,7 @@ class QwenBrain:
         self._lock = threading.Lock()
         self._history_gen = 0
         self._client = httpx.Client(
-            timeout=httpx.Timeout(connect=5.0, read=45.0, write=10.0, pool=5.0)
+            timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
         )
 
     def close(self) -> None:

@@ -206,8 +206,27 @@ class HalRuntime:
         if self._loader_thread is not None and self._loader_thread.is_alive():
             self._loader_thread.join(timeout=2.0)
 
+    def _warmup_ollama_async(self) -> None:
+        if not self.ollama_available:
+            return
+        try:
+            import httpx
+
+            with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)) as client:
+                client.post(
+                    f"{self.ollama_url.rstrip('/')}/api/chat",
+                    json={"model": self.default_model, "messages": [], "keep_alive": "30m"},
+                )
+            logger.info("Preloaded Ollama model %s into memory.", self.default_model)
+        except (httpx.HTTPError, OSError) as exc:
+            logger.warning("Ollama preload skipped for %s: %s", self.default_model, exc)
+
     def _load_models(self) -> None:
         try:
+            # Overlap Ollama model residency preload with local Whisper + VoxCPM2 load
+            if self.ollama_available:
+                threading.Thread(target=self._warmup_ollama_async, daemon=True).start()
+
             if self.stt is None:
                 self.stage = "LOADING WHISPER LARGE-V3..."
                 self._broadcast_from_thread(self.status_payload(include_model=False))
@@ -585,6 +604,15 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
 
                 elif mtype == "ptt_stop":
                     if not mic.is_recording:
+                        enqueue_on_loop(
+                            "json",
+                            {
+                                "type": "state",
+                                "turn_id": client_tid,
+                                "state": "idle",
+                                "detail": "ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK",
+                            },
+                        )
                         continue
                     audio = await stop_local_mic_async()
                     dur_s = audio.size / float(mic.sample_rate)

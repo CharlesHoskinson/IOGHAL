@@ -297,6 +297,57 @@ class TestPipelineAndServer(unittest.TestCase):
             (frame_tid,) = struct.unpack("<I", frame[:4])
             self.assertEqual(frame_tid, 3)
 
+    def test_ptt_stop_without_active_mic_returns_idle_ack(self) -> None:
+        """Regression test for Quint-found stuck-thinking race when ptt_start failed before ptt_stop."""
+        runtime = HalRuntime(
+            HalConfig(model="mock", steps=6),
+            stt=_FakeSTT(),
+            tts=_FakeTTS(),
+            brain_factory=lambda rt: QwenBrain(model="mock"),
+        )
+        router = create_hal_router(runtime)
+        ws_route = next(r for r in router.routes if getattr(r, "path", "") == "/ws")
+
+        sent_json: list[dict] = []
+        incoming = asyncio.Queue()
+        incoming.put_nowait('{"type":"ptt_stop","turn_id":9,"capture_id":1}')
+
+        class _FakeWS:
+            def __init__(self) -> None:
+                self.headers = {"origin": "http://127.0.0.1:8765"}
+
+            async def accept(self) -> None:
+                pass
+
+            async def close(self, code: int = 1000) -> None:
+                pass
+
+            async def receive_text(self) -> str:
+                item = await incoming.get()
+                if item is None:
+                    from fastapi import WebSocketDisconnect
+
+                    raise WebSocketDisconnect()
+                return item
+
+            async def send_json(self, payload: dict) -> None:
+                sent_json.append(payload)
+                if payload.get("type") == "state" and payload.get("turn_id") == 9:
+                    incoming.put_nowait(None)
+
+            async def send_bytes(self, data: bytes) -> None:
+                pass
+
+        async def run_ws() -> None:
+            runtime.set_loop(asyncio.get_running_loop())
+            await ws_route.endpoint(_FakeWS())
+
+        asyncio.run(run_ws())
+        idle_acks = [
+            m for m in sent_json if m.get("type") == "state" and m.get("turn_id") == 9 and m.get("state") == "idle"
+        ]
+        self.assertEqual(len(idle_acks), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
