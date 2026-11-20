@@ -155,6 +155,7 @@ class WhisperSTT:
             "language": "en",
             "task": "transcribe",
             "max_length": 256,
+            "temperature": 0.0,
             "no_speech_threshold": 0.6,
             "logprob_threshold": -1.0,
             "compression_ratio_threshold": 1.35,
