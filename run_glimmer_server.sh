@@ -33,6 +33,8 @@ CACHE_REUSE="${HAL_CACHE_REUSE:-0}"
 BACKEND_SAMPLING="${HAL_BACKEND_SAMPLING:-0}"
 NO_REASONING_PRESERVE="${HAL_NO_REASONING_PRESERVE:-1}"
 SLICE="${HAL_SYSTEMD_SLICE-heavy.slice}"
+# Require >= 28 GiB cgroup headroom (model + draft + KV + unified page-cache) before entering slice
+MIN_SLICE_HEADROOM_BYTES="${HAL_MIN_SLICE_HEADROOM_BYTES:-30064771072}"
 
 if [ -n "${HAL_LLAMA_SERVER:-}" ]; then
   LLAMA_BIN="${HAL_LLAMA_SERVER}"
@@ -122,9 +124,32 @@ fi
 echo "Launching Muse-Glimmer-30B + DFlash-${DRAFT_N_MAX} via ${ENGINE_LABEL}" >&2
 
 if [ -n "${SLICE}" ] && command -v systemd-run >/dev/null 2>&1 && systemctl --user status "${SLICE}" >/dev/null 2>&1; then
-  exec systemd-run --user --slice="${SLICE}" --scope \
-    --working-directory="${WORK_DIR}" \
-    "${LLAMA_BIN}" "${SERVER_ARGS[@]}" "$@"
+  USE_SLICE=1
+  if [[ "${MIN_SLICE_HEADROOM_BYTES}" =~ ^[0-9]+$ ]] && [ "${MIN_SLICE_HEADROOM_BYTES}" -gt 0 ]; then
+    SLICE_MEM_CUR="$(systemctl --user show "${SLICE}" -p MemoryCurrent --value 2>/dev/null || true)"
+    SLICE_MEM_HIGH="$(systemctl --user show "${SLICE}" -p MemoryHigh --value 2>/dev/null || true)"
+    SLICE_MEM_MAX="$(systemctl --user show "${SLICE}" -p MemoryMax --value 2>/dev/null || true)"
+    SLICE_LIMIT=""
+    for cand in "${SLICE_MEM_HIGH}" "${SLICE_MEM_MAX}"; do
+      if [[ "${cand}" =~ ^[0-9]+$ ]]; then
+        if [ -z "${SLICE_LIMIT}" ] || [ "${cand}" -lt "${SLICE_LIMIT}" ]; then
+          SLICE_LIMIT="${cand}"
+        fi
+      fi
+    done
+    if [[ "${SLICE_MEM_CUR}" =~ ^[0-9]+$ ]] && [ -n "${SLICE_LIMIT}" ]; then
+      SLICE_HEADROOM=$(( SLICE_LIMIT - SLICE_MEM_CUR ))
+      if [ "${SLICE_HEADROOM}" -lt "${MIN_SLICE_HEADROOM_BYTES}" ]; then
+        echo "Warning: ${SLICE} headroom ($(( SLICE_HEADROOM / 1073741824 )) GiB; cur=$(( SLICE_MEM_CUR / 1073741824 )) GiB, limit=$(( SLICE_LIMIT / 1073741824 )) GiB) < $(( MIN_SLICE_HEADROOM_BYTES / 1073741824 )) GiB — bypassing ${SLICE} to avoid unified-memory CUDA OOM." >&2
+        USE_SLICE=0
+      fi
+    fi
+  fi
+  if [ "${USE_SLICE}" = "1" ]; then
+    exec systemd-run --user --slice="${SLICE}" --scope \
+      --working-directory="${WORK_DIR}" \
+      "${LLAMA_BIN}" "${SERVER_ARGS[@]}" "$@"
+  fi
 fi
 
 cd "${WORK_DIR}"
