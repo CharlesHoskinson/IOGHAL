@@ -20,6 +20,29 @@ EventSink = Callable[[HalEvent], bool | None]
 _SENTENCE_QUEUE_MAX = 4
 _QUEUE_POLL_S = 0.01
 _LE_FLOAT32 = np.dtype("<f4")
+_STT_SAMPLE_RATE = 16000
+
+
+def _resample_for_stt(audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int]:
+    """Fast C++ SIMD resampling to 16 kHz outside ``gpu_lock`` (falls back cleanly if soxr absent)."""
+    if sample_rate == _STT_SAMPLE_RATE:
+        return audio, sample_rate
+    arr = np.asarray(audio, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = arr.mean(axis=-1).astype(np.float32, copy=False)
+    else:
+        arr = arr.reshape(-1)
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        return arr, sample_rate
+    try:
+        import soxr
+
+        resampled = soxr.resample(arr, sample_rate, _STT_SAMPLE_RATE).astype(
+            np.float32, copy=False
+        )
+        return resampled, _STT_SAMPLE_RATE
+    except (ImportError, RuntimeError, ValueError, OSError):
+        return audio, sample_rate
 
 
 def _brain_accepts_param(brain: BrainProvider, name: str) -> bool:
@@ -113,11 +136,12 @@ class HalPipeline:
                     {"state": "thinking", "detail": "TRANSCRIBING SPEECH..."},
                 )
                 t0 = time.perf_counter()
+                stt_audio, stt_sr = _resample_for_stt(audio, sample_rate)
                 with self.gpu_lock:
                     if cancel_event.is_set():
                         result.cancelled = True
                         return result
-                    user_text = self.stt.transcribe(audio, sample_rate)
+                    user_text = self.stt.transcribe(stt_audio, stt_sr)
                 result.stt_seconds = time.perf_counter() - t0
                 logger.info("Turn %d STT (%.2fs): %r", turn_id, result.stt_seconds, user_text)
 
@@ -141,6 +165,7 @@ class HalPipeline:
 
             # Optional non-fatal live web search stage for current/encyclopedic queries
             web_context = ""
+            web_search_elapsed = 0.0
             if (
                 getattr(self.brain, "enable_web_search", False)
                 and self._brain_accepts_extra_context
@@ -155,6 +180,7 @@ class HalPipeline:
                 except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
                     logger.debug("Turn %d web search fallback: %s", turn_id, exc)
                     web_context = ""
+                web_search_elapsed = time.perf_counter() - t_web
                 if cancel_event.is_set():
                     result.cancelled = True
                     return result
@@ -163,7 +189,7 @@ class HalPipeline:
                         "Turn %d web context fetched (%d chars in %.2fs)",
                         turn_id,
                         len(web_context),
-                        time.perf_counter() - t_web,
+                        web_search_elapsed,
                     )
 
             model_label = (
@@ -177,6 +203,9 @@ class HalPipeline:
             )
 
             t_start = time.perf_counter()
+            t_first_sentence: float | None = None
+            llm_first_sentence_s: float | None = None
+            tts_first_chunk_s: float | None = None
             emitted_samples = 0
             gen_elapsed = 0.0
 
@@ -241,6 +270,9 @@ class HalPipeline:
                 if cancel_event.is_set():
                     result.cancelled = True
                     break
+                if t_first_sentence is None:
+                    t_first_sentence = time.perf_counter()
+                    llm_first_sentence_s = t_first_sentence - t_start
                 logger.info("Turn %d HAL sentence: %r", turn_id, sentence)
 
                 sentence_has_audio = False
@@ -288,15 +320,25 @@ class HalPipeline:
                             sentence_has_audio = True
                             emit("hal_partial", {"text": partial_text})
                         if result.first_chunk_seconds is None:
-                            result.first_chunk_seconds = time.perf_counter() - t_start
+                            t_first_chunk = time.perf_counter()
+                            result.first_chunk_seconds = t_first_chunk - t_start
+                            if t_first_sentence is not None:
+                                tts_first_chunk_s = t_first_chunk - t_first_sentence
                             emit("state", {"state": "speaking", "detail": "HAL 9000 SPEAKING..."})
-                            emit(
-                                "metrics",
-                                {
-                                    "stt_s": round(result.stt_seconds, 2),
-                                    "first_chunk_s": round(result.first_chunk_seconds, 2),
-                                },
-                            )
+                            metrics_payload: dict[str, float] = {
+                                "stt_s": round(result.stt_seconds, 2),
+                                "first_chunk_s": round(result.first_chunk_seconds, 2),
+                                "web_search_s": round(web_search_elapsed, 3),
+                            }
+                            if llm_first_sentence_s is not None:
+                                metrics_payload["llm_first_sentence_s"] = round(
+                                    llm_first_sentence_s, 3
+                                )
+                            if tts_first_chunk_s is not None:
+                                metrics_payload["tts_first_chunk_s"] = round(
+                                    tts_first_chunk_s, 3
+                                )
+                            emit("metrics", metrics_payload)
                         emitted_samples += arr.size
                         if not emit("audio_chunk", {}, pcm=arr):
                             cancel_event.set()
@@ -332,14 +374,17 @@ class HalPipeline:
 
             if audio_started and result.audio_seconds > 0 and gen_elapsed > 0:
                 rtf = gen_elapsed / result.audio_seconds
-                emit(
-                    "metrics",
-                    {
-                        "stt_s": round(result.stt_seconds, 2),
-                        "first_chunk_s": round(result.first_chunk_seconds or 0.0, 2),
-                        "rtf": round(rtf, 2),
-                    },
-                )
+                final_metrics: dict[str, float] = {
+                    "stt_s": round(result.stt_seconds, 2),
+                    "first_chunk_s": round(result.first_chunk_seconds or 0.0, 2),
+                    "rtf": round(rtf, 2),
+                    "web_search_s": round(web_search_elapsed, 3),
+                }
+                if llm_first_sentence_s is not None:
+                    final_metrics["llm_first_sentence_s"] = round(llm_first_sentence_s, 3)
+                if tts_first_chunk_s is not None:
+                    final_metrics["tts_first_chunk_s"] = round(tts_first_chunk_s, 3)
+                emit("metrics", final_metrics)
         except Exception as exc:
             logger.exception("Turn %d failed", turn_id)
             cancel_event.set()

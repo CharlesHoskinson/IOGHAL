@@ -295,6 +295,95 @@ module ioghal_protocol_test {
       .expect(not(clients.get(1).protocolViolation))
       .expect(allInvariants)
 
+  // 16. Rapid double-PTT after capture limit resets micLimitHit & capture_id cleanly while keeping exclusive mic ownership.
+  run rapidDoublePttResetsCaptureAndLimitTest =
+    init
+      .then(clientBeginPtt(1, SpaceOwner))
+      .then(serverProcessC2S(1))
+      .then(clientReceiveS2C(1)) // EvState(UiListening, cid=1)
+      .then(serverMicHitLimit(1))
+      .expect(servers.get(1).micLimitHit)
+      .then(clientRapidDoublePtt(1)) // rapid second MsgPttStart(cid=2) before handling capture_limit
+      .then(serverProcessC2S(1))     // server stops/restarts mic cleanly & clears micLimitHit!
+      .expect(servers.get(1).micRecording)
+      .expect(not(servers.get(1).micLimitHit))
+      .expect(servers.get(1).micCaptureId == 2)
+      .expect(hw.micOwner == 1)
+      .expect(cov.rapidDoublePtt)
+      .then(clientReceiveS2C(1)) // stale EvCaptureLimit(cid=1) ignored because activeCaptureId == 2
+      .then(clientReceiveS2C(1)) // EvState(UiListening, cid=2)
+      .expect(clients.get(1).pttActive)
+      .expect(clients.get(1).uiState == UiListening)
+      .expect(allInvariants)
+
+  // 17. WebSocket disconnect mid-turn while BOTH LLM stream and TTS GPU are active immediately clears
+  //     llmStreamActive, retires GPU holder cleanly, and allows full reconnect + fresh turn.
+  run disconnectDuringActiveTtsAndLlmReleasesResourcesTest =
+    init
+      .then(clientSubmitText(1))
+      .then(serverProcessC2S(1))
+      .then(workerSearchComplete(1, false, false))
+      .then(workerLlmProduceSentence(1))
+      .then(workerTtsPopAndAcquireGpu(1))
+      .then(workerTtsEmitChunk(1))
+      .expect(servers.get(1).llmStreamActive)
+      .expect(servers.get(1).ttsHoldingGpu)
+      .then(clientDisconnect(1)) // abrupt WS drop during active TTS + LLM!
+      .expect(not(servers.get(1).llmStreamActive))
+      .expect(not(servers.get(1).ttsHoldingGpu))
+      .expect(cov.disconnectDuringActivePipeline)
+      .then(retiredWorkerReleaseGpu)
+      .expect(hw.gpuHolder == GpuFree)
+      .then(clientReconnect(1))
+      .then(clientSubmitText(1))
+      .then(serverProcessC2S(1))
+      .then(workerSearchComplete(1, false, false))
+      .then(workerLlmProduceSentence(1))
+      .then(workerLlmFinish(1))
+      .then(workerTtsPopAndAcquireGpu(1))
+      .then(workerTtsEmitChunk(1))
+      .then(workerTtsFinishSentence(1))
+      .then(workerPipelineFinish(1))
+      .then(clientReceiveS2C(1))
+      .then(clientReceiveS2C(1))
+      .then(clientReceiveS2C(1))
+      .then(clientPlaybackDrain(1))
+      .expect(clients.get(1).uiState == UiIdle)
+      .expect(allInvariants)
+
+  // 18. Background boot warmup holding GPU while first voice turn arrives serializes cleanly
+  //     without violating GPU mutual exclusion or leaving client stuck in UiThinking.
+  run warmupVsFirstTurnGpuContentionTest =
+    init
+      .then(runtimeWarmupAcquire)
+      .expect(hw.gpuHolder == GpuWarmup)
+      .then(clientBeginPtt(1, SpaceOwner))
+      .then(serverProcessC2S(1))
+      .then(clientReceiveS2C(1))
+      .then(clientFinishPtt(1, true))
+      .then(serverProcessC2S(1))
+      .expect(servers.get(1).workerStage == WorkerStt)
+      .expect(not(servers.get(1).sttHoldingGpu))
+      .then(runtimeWarmupRelease)
+      .expect(hw.gpuHolder == GpuFree)
+      .then(workerSttAcquireGpu(1))
+      .then(workerSttComplete(1, true))
+      .then(clientReceiveS2C(1))
+      .then(workerSearchComplete(1, false, false))
+      .then(workerLlmProduceSentence(1))
+      .then(workerLlmFinish(1))
+      .then(workerTtsPopAndAcquireGpu(1))
+      .then(workerTtsEmitChunk(1))
+      .then(workerTtsFinishSentence(1))
+      .then(workerPipelineFinish(1))
+      .then(clientReceiveS2C(1))
+      .then(clientReceiveS2C(1))
+      .then(clientReceiveS2C(1))
+      .then(clientPlaybackDrain(1))
+      .expect(cov.warmupGpuContention)
+      .expect(clients.get(1).uiState == UiIdle)
+      .expect(allInvariants)
+
   // Connected-session step omitting random disconnects so multi-turn replay & LLM/TTS overlap
   // are deeply stress-tested across thousands of random traces.
   action stepConnected: bool = {
@@ -304,6 +393,7 @@ module ioghal_protocol_test {
       runtimeWarmupRelease,
       retiredWorkerReleaseGpu,
       clientBeginPtt(id, SpaceOwner),
+      clientRapidDoublePtt(id),
       clientTapLatch(id),
       clientFinishPtt(id, true),
       clientFinishPtt(id, false),

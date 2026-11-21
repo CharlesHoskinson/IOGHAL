@@ -47,6 +47,7 @@ from .tts import (
     HalVoiceEngine,
     resolve_reference_wav,
 )
+from .websearch import warm_search_connections
 
 logger = logging.getLogger(__name__)
 
@@ -502,9 +503,10 @@ class HalRuntime:
             self._broadcast_from_thread(self.status_payload(include_model=False))
             logger.info("IOGHAL runtime operational in %.2fs.", time.perf_counter() - t_boot)
 
-            # Warm CUDA streaming kernels and preload Ollama after weights are resident
+            # Warm CUDA streaming kernels, preload LLM, and pre-warm Wikipedia TLS keep-alive socket
             threading.Thread(target=self._warmup_tts_async, daemon=True).start()
             self.schedule_ollama_warmup(self.default_model)
+            threading.Thread(target=warm_search_connections, daemon=True).start()
         except Exception as exc:
             logger.exception("Failed to initialize IOGHAL runtime")
             self.error = str(exc)
@@ -862,10 +864,13 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                         )
                         continue
                     try:
+                        # Rapid double-PTT guard: discard any prior capture buffer (including hit-limit
+                        # buffers) before opening a fresh capture while keeping mic_owner held exclusively.
+                        if mic.is_recording:
+                            await asyncio.to_thread(mic.stop)
                         with state_lock:
                             active_capture_id = capture_id
-                        if not mic.is_recording:
-                            await asyncio.to_thread(mic.start)
+                        await asyncio.to_thread(mic.start)
                         logger.info("PTT started (PipeWire local mic, capture_id=%s)", capture_id)
                         enqueue_on_loop(
                             "json",
@@ -1221,7 +1226,13 @@ def main() -> None:
     )
     runtime = HalRuntime(cfg)
     app = create_app(runtime)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        ws_per_message_deflate=not runtime.is_loopback,
+    )
 
 
 if __name__ == "__main__":

@@ -314,4 +314,21 @@ module glimmer_runtime_test {
       .then(pipelineCompleteClean(1))
       .expect(history.length() == 1)
       .expect(allInvariants)
+
+  // Fixed 9: Boot/switch llama-server KV-prefix warmup in progress on single llmSlot is cancelled
+  // immediately when Turn 1 arrives (`runtime.cancel_inflight_warmups()`), freeing llmSlot cleanly.
+  run fixedLlamaWarmupCancelledByFirstTurnTest =
+    init
+      .then(llamaWarmupStart)
+      .expect(isSlotWarmup(llmSlot))
+      .then(startTurn(1, ModeZeroThink))
+      .expect(isSlotFree(llmSlot))
+      .expect(cov.llamaWarmupCancelledByFirstTurn)
+      .then(llmOpenStream(1))
+      .then(llmProduceSentence(1))
+      .then(llmFinishAheadOfTts(1))
+      .then(ttsSpeakSentence(1))
+      .then(pipelineCompleteClean(1))
+      .expect(history.length() == 1)
+      .expect(allInvariants)
 }

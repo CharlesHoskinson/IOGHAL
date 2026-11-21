@@ -130,6 +130,8 @@ module ioghal_protocol {
     thinkingSelfBargeIn: bool,
     emptyThinkingRecovery: bool,
     replaySuspendedGuard: bool,
+    rapidDoublePtt: bool,
+    disconnectDuringActivePipeline: bool,
   }
 
   var clients: int -> ClientState
@@ -206,6 +208,8 @@ module ioghal_protocol {
     thinkingSelfBargeIn: false,
     emptyThinkingRecovery: false,
     replaySuspendedGuard: false,
+    rapidDoublePtt: false,
+    disconnectDuringActivePipeline: false,
   }
 
   pure def isClientGpuHolder(h: GpuHolder, id: int): bool =
@@ -312,6 +316,29 @@ module ioghal_protocol {
       s2c' = s2c,
       hw' = hw,
       cov' = { ...cov, bargeIn: cov.bargeIn or c.playingTurnId != 0 or c.pendingTurn },
+    }
+  }
+
+  // Models a rapid duplicate MsgPttStart arriving on the wire while already recording locally
+  // (e.g., scripted client or reconnect/race). Server must restart mic cleanly & clear micLimitHit.
+  action clientRapidDoublePtt(id: int): bool = {
+    val c = clients.get(id)
+    val cid = c.nextCaptureId
+    all {
+      c.connected,
+      c.pttActive,
+      c.captureMode == ModeLocal,
+      c.nextCaptureId < MAX_TURN_ID,
+      clients' = clients.put(id, {
+        ...c,
+        activeCaptureId: cid,
+        nextCaptureId: cid + 1,
+      }),
+      c2s' = c2s.put(id, c2s.get(id).append(MsgPttStart({ cid: cid }))),
+      servers' = servers,
+      s2c' = s2c,
+      hw' = hw,
+      cov' = cov,
     }
   }
 
@@ -723,7 +750,13 @@ module ioghal_protocol {
         ...hw,
         micOwner: if (hw.micOwner == id) 0 else hw.micOwner,
       },
-      cov' = { ...cov, disconnectCleanup: true },
+      cov' = {
+        ...cov,
+        disconnectCleanup: true,
+        disconnectDuringActivePipeline:
+          cov.disconnectDuringActivePipeline or
+          (s.workerStage == WorkerPipeline and (s.ttsHoldingGpu or s.llmStreamActive)),
+      },
     }
   }
 
@@ -776,7 +809,11 @@ module ioghal_protocol {
               s2c' = s2c.put(id, s2c.get(id).append(EvState({ tid: 0, cid: p.cid, ui: UiListening }))),
               c2s' = c2s.put(id, rest),
               clients' = clients,
-              cov' = { ...cov, thinkingSelfBargeIn: cov.thinkingSelfBargeIn or wasThinking },
+              cov' = {
+                ...cov,
+                thinkingSelfBargeIn: cov.thinkingSelfBargeIn or wasThinking,
+                rapidDoublePtt: cov.rapidDoublePtt or s.micRecording,
+              },
             } else all {
               servers' = servers.put(id, {
                 ...s,
@@ -1359,6 +1396,7 @@ module ioghal_protocol {
       clientBeginPtt(id, SpaceOwner),
       clientBeginPtt(id, PointerOwner),
       clientBeginPtt(id, ToggleOwner),
+      clientRapidDoublePtt(id),
       clientTapLatch(id),
       clientFinishPtt(id, true),
       clientFinishPtt(id, false),
@@ -1534,4 +1572,6 @@ module ioghal_protocol {
   val wThinkingSelfBargeIn: bool = cov.thinkingSelfBargeIn
   val wEmptyThinkingRecovery: bool = cov.emptyThinkingRecovery
   val wReplaySuspendedGuard: bool = cov.replaySuspendedGuard
+  val wRapidDoublePtt: bool = cov.rapidDoublePtt
+  val wDisconnectDuringActivePipeline: bool = cov.disconnectDuringActivePipeline
 }

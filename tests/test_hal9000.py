@@ -1291,6 +1291,191 @@ class TestPipelineAndServer(unittest.TestCase):
         self.assertEqual(HalConfig().reasoning_budget, 48)
         brain.close()
 
+    def test_rapid_double_ptt_restarts_mic_and_clears_stale_capture(self) -> None:
+        """Rapid double ptt_start stops stale recording before starting a fresh capture."""
+        runtime = HalRuntime(
+            HalConfig(model="mock", steps=6),
+            stt=_FakeSTT(),
+            tts=_FakeTTS(),
+            brain_factory=lambda rt: QwenBrain(model="mock", enable_web_search=False),
+        )
+        router = create_hal_router(runtime)
+        ws_route = next(r for r in router.routes if getattr(r, "path", "") == "/ws")
+
+        lifecycle: list[str] = []
+        sent_json: list[dict] = []
+        incoming = asyncio.Queue()
+        incoming.put_nowait('{"type":"ptt_start","capture_id":1}')
+        incoming.put_nowait('{"type":"ptt_start","capture_id":2}')
+        incoming.put_nowait(None)
+
+        class _MockMic:
+            sample_rate = 16000
+
+            def __init__(self, *args, **kwargs) -> None:
+                self.is_recording = False
+
+            def start(self) -> None:
+                lifecycle.append("start")
+                self.is_recording = True
+
+            def stop(self) -> np.ndarray:
+                lifecycle.append("stop")
+                self.is_recording = False
+                return np.zeros(0, dtype=np.float32)
+
+        class _FakeWS:
+            def __init__(self) -> None:
+                self.headers = {"origin": "http://127.0.0.1:8765"}
+
+            async def accept(self) -> None:
+                pass
+
+            async def close(self, code: int = 1000) -> None:
+                pass
+
+            async def receive_text(self) -> str:
+                item = await incoming.get()
+                if item is None:
+                    from fastapi import WebSocketDisconnect
+
+                    raise WebSocketDisconnect()
+                return item
+
+            async def send_json(self, payload: dict) -> None:
+                sent_json.append(payload)
+
+            async def send_bytes(self, data: bytes) -> None:
+                pass
+
+        async def run_ws() -> None:
+            runtime.set_loop(asyncio.get_running_loop())
+            await ws_route.endpoint(_FakeWS())
+
+        with patch("hal9000.server.MicRecorder", _MockMic):
+            asyncio.run(run_ws())
+
+        # Expect start(cid=1) -> stop(cid=1) -> start(cid=2) -> final disconnect stop
+        self.assertGreaterEqual(len(lifecycle), 3)
+        self.assertEqual(lifecycle[:3], ["start", "stop", "start"])
+        listening = [m for m in sent_json if m.get("type") == "state" and m.get("state") == "listening"]
+        self.assertEqual([m["capture_id"] for m in listening], [1, 2])
+        self.assertIsNone(runtime.mic_owner)
+
+    def test_pipeline_resamples_outside_gpu_lock_and_emits_granular_metrics(self) -> None:
+        """48 kHz audio is resampled to 16 kHz before STT and metrics expose LLM/TTS breakdown."""
+        seen_sr: list[int] = []
+
+        class _CheckSrSTT:
+            def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
+                seen_sr.append(sample_rate)
+                return "Open the pod bay doors"
+
+        brain = QwenBrain(model="mock", enable_web_search=False)
+        tts = _FakeTTS()
+        pipeline = HalPipeline(brain=brain, tts=tts, stt=_CheckSrSTT())
+        events: list[HalEvent] = []
+        audio_48k = np.full(48000, 0.05, dtype=np.float32)
+        try:
+            res = pipeline.run_turn(
+                turn_id=31,
+                cancel_event=threading.Event(),
+                on_event=lambda ev: events.append(ev) or True,
+                audio=audio_48k,
+                sample_rate=48000,
+            )
+        finally:
+            brain.close()
+
+        self.assertFalse(res.failed)
+        self.assertEqual(seen_sr, [16000])
+        metric_evs = [e.payload for e in events if e.kind == "metrics"]
+        self.assertGreaterEqual(len(metric_evs), 1)
+        last_m = metric_evs[-1]
+        self.assertIn("web_search_s", last_m)
+        self.assertIn("llm_first_sentence_s", last_m)
+        self.assertIn("tts_first_chunk_s", last_m)
+        self.assertGreaterEqual(last_m["llm_first_sentence_s"], 0.0)
+        self.assertGreaterEqual(last_m["tts_first_chunk_s"], 0.0)
+
+    def test_websearch_evergreen_fast_grace_and_pooled_client_reuse(self) -> None:
+        """Evergreen Wikipedia hits return after ~50ms grace and reuse warm keep-alive clients."""
+        import time
+
+        from hal9000.websearch import (
+            _is_recency_query,
+            clear_search_cache,
+            search_web_context,
+        )
+
+        self.assertFalse(_is_recency_query("Search online to see if the Riemann hypothesis has been solved."))
+        self.assertTrue(_is_recency_query("What is the current price of Bitcoin today?"))
+
+        clear_search_cache()
+        created_clients: list[object] = []
+
+        class _FakeResp:
+            def __init__(self, status_code: int, payload: dict) -> None:
+                self.status_code = status_code
+                self._payload = payload
+                self.text = ""
+
+            def json(self) -> dict:
+                return self._payload
+
+        class _PoolClient:
+            def __init__(self, *args, **kwargs) -> None:
+                self.is_closed = False
+                self._closed = threading.Event()
+                created_clients.append(self)
+
+            def get(self, url: str, params=None):
+                if "en.wikipedia.org/w/api.php" in url:
+                    q = (params or {}).get("srsearch", "")
+                    title = "Goldbach's conjecture" if "goldbach" in q.lower() else "Riemann hypothesis"
+                    return _FakeResp(200, {"query": {"search": [{"title": title, "snippet": "Unsolved."}]}})
+                if "en.wikipedia.org/api/rest_v1/page/summary" in url:
+                    return _FakeResp(
+                        200,
+                        {
+                            "extract": (
+                                "This famous open conjecture in number theory has been verified for huge bounds "
+                                "and remains an unsolved mathematical problem."
+                            )
+                        },
+                    )
+                if self._closed.wait(timeout=2.0):
+                    raise RuntimeError("ddg aborted")
+                return _FakeResp(200, {})
+
+            def close(self) -> None:
+                self.is_closed = True
+                self._closed.set()
+
+        with patch("hal9000.websearch.httpx.Client", _PoolClient):
+            t0 = time.perf_counter()
+            r1 = search_web_context(
+                "Search online to see if the Riemann hypothesis has been solved.",
+                timeout_s=3.5,
+            )
+            dt1 = time.perf_counter() - t0
+            clients_after_q1 = len(created_clients)
+
+            # Second distinct evergreen query reuses the pooled healthy Wikipedia client (only 1 new DDG client!)
+            r2 = search_web_context(
+                "Search online to see if Goldbach conjecture has been solved.",
+                timeout_s=3.5,
+            )
+            clients_after_q2 = len(created_clients)
+
+        self.assertIn("Riemann hypothesis", r1)
+        self.assertIn("Goldbach", r2)
+        self.assertLess(dt1, 0.3)
+        self.assertEqual(clients_after_q1, 2)
+        self.assertEqual(clients_after_q2, 3)
+        clear_search_cache()
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,16 +19,97 @@ _CACHE_TTL_S = 300.0
 _CACHE_MAX_ENTRIES = 128
 _WIKI_RICH_MIN_CHARS = 120
 _DDG_GRACE_AFTER_WIKI_S = 0.35
+_DDG_GRACE_EVERGREEN_S = 0.05
 _CANCEL_POLL_S = 0.02
 
 _cache_lock = threading.Lock()
 _query_cache: dict[str, tuple[float, str]] = {}
 
 
+class _ProviderPool:
+    """Thread-safe keep-alive ``httpx.Client`` pool for a single search host with instant cancel eviction."""
+
+    def __init__(self, headers: dict[str, str]) -> None:
+        self._headers = headers
+        self._lock = threading.Lock()
+        self._idle: list[httpx.Client] = []
+
+    def acquire(self, *, timeout_s: float) -> httpx.Client:
+        with self._lock:
+            while self._idle:
+                client = self._idle.pop()
+                if not getattr(client, "is_closed", False):
+                    return client
+        return httpx.Client(
+            timeout=httpx.Timeout(
+                connect=min(2.0, timeout_s),
+                read=timeout_s,
+                write=2.0,
+                pool=2.0,
+            ),
+            limits=httpx.Limits(
+                max_keepalive_connections=4,
+                max_connections=8,
+                keepalive_expiry=60.0,
+            ),
+            follow_redirects=True,
+            headers=self._headers,
+        )
+
+    def release(self, client: httpx.Client, *, healthy: bool) -> None:
+        if healthy and not getattr(client, "is_closed", False):
+            with self._lock:
+                if len(self._idle) < 2:
+                    self._idle.append(client)
+                    return
+        with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
+            client.close()
+
+    def close_all(self) -> None:
+        with self._lock:
+            clients = list(self._idle)
+            self._idle.clear()
+        for client in clients:
+            with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
+                client.close()
+
+
+_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_WIKI_HEADERS = {"User-Agent": "IOGHAL-Voice-Runtime/1.0 (local research client)"}
+_DDG_HEADERS = {"User-Agent": _USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+
+_wiki_pool = _ProviderPool(_WIKI_HEADERS)
+_ddg_pool = _ProviderPool(_DDG_HEADERS)
+
+
+def close_search_clients() -> None:
+    """Close any idle keep-alive search clients."""
+    _wiki_pool.close_all()
+    _ddg_pool.close_all()
+
+
+def warm_search_connections(timeout_s: float = 2.0) -> bool:
+    """Pre-warm Wikipedia TLS keep-alive socket in the background to cut first-search latency."""
+    client = _wiki_pool.acquire(timeout_s=timeout_s)
+    healthy = False
+    try:
+        resp = client.head("https://en.wikipedia.org/w/api.php", timeout=timeout_s)
+        healthy = resp.status_code < 500
+        return healthy
+    except (httpx.HTTPError, OSError, RuntimeError):
+        return False
+    finally:
+        _wiki_pool.release(client, healthy=healthy)
+
+
 def clear_search_cache() -> None:
-    """Clear the in-memory web search TTL cache."""
+    """Clear the in-memory web search TTL cache and reset pooled search clients."""
     with _cache_lock:
         _query_cache.clear()
+    close_search_clients()
 
 
 def _cache_get(key: str) -> str | None:
@@ -72,32 +153,28 @@ class _CancelGroup:
             self._external is not None and self._external.is_set()
         )
 
-    def create_client(
-        self, *, timeout_s: float, headers: dict[str, str]
+    def acquire_client(
+        self, pool: _ProviderPool, *, timeout_s: float
     ) -> httpx.Client | None:
-        client = httpx.Client(
-            timeout=httpx.Timeout(
-                connect=min(2.0, timeout_s),
-                read=timeout_s,
-                write=2.0,
-                pool=2.0,
-            ),
-            follow_redirects=True,
-            headers=headers,
-        )
         with self._lock:
             if self.is_cancelled():
-                with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
-                    client.close()
+                return None
+        client = pool.acquire(timeout_s=timeout_s)
+        with self._lock:
+            if self.is_cancelled():
+                pool.release(client, healthy=False)
                 return None
             self._clients.add(client)
         return client
 
-    def release_client(self, client: httpx.Client) -> None:
+    def release_client(
+        self, client: httpx.Client, *, pool: _ProviderPool, healthy: bool
+    ) -> None:
         with self._lock:
+            was_tracked = client in self._clients
             self._clients.discard(client)
-        with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
-            client.close()
+            keep = healthy and was_tracked and not self.is_cancelled()
+        pool.release(client, healthy=keep)
 
     def abort(self) -> None:
         self._aborted.set()
@@ -108,10 +185,21 @@ class _CancelGroup:
             with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
                 client.close()
 
-_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+_RECENCY_QUERY_RE = re.compile(
+    r"\b(?:"
+    r"latest\s+news|current\s+(?:price|status|president|ceo|score|weather|news|year|date|record)"
+    r"|today(?:'s)?|tonight|right\s+now|recently|this\s+(?:week|month|year)"
+    r"|price\s+of|market\s+cap|weather\s+in|who\s+won|score\s+of"
+    r"|202[5-9]|203\d"
+    r")\b",
+    re.IGNORECASE,
 )
+
+
+def _is_recency_query(user_text: str) -> bool:
+    """Return True when live DDG snippets are valuable even after a rich Wikipedia hit."""
+    return bool(_RECENCY_QUERY_RE.search(user_text))
 
 _EXPLICIT_SEARCH_RE = re.compile(
     r"\b(?:"
@@ -227,21 +315,18 @@ def _fetch_ddg_lite(
     timeout_s: float,
     cancel_group: _CancelGroup | None = None,
 ) -> list[str]:
-    headers = {"User-Agent": _USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
     client: httpx.Client | None = None
+    healthy = False
     try:
         if cancel_group is not None:
-            client = cancel_group.create_client(timeout_s=timeout_s, headers=headers)
+            client = cancel_group.acquire_client(_ddg_pool, timeout_s=timeout_s)
             if client is None:
                 return []
         else:
-            client = httpx.Client(
-                timeout=httpx.Timeout(connect=2.0, read=timeout_s, write=2.0, pool=2.0),
-                follow_redirects=True,
-                headers=headers,
-            )
+            client = _ddg_pool.acquire(timeout_s=timeout_s)
         url = f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
         resp = client.get(url)
+        healthy = True
         if resp.status_code != 200:
             return []
         parser = _DDGLiteParser()
@@ -258,10 +343,9 @@ def _fetch_ddg_lite(
     finally:
         if client is not None:
             if cancel_group is not None:
-                cancel_group.release_client(client)
+                cancel_group.release_client(client, pool=_ddg_pool, healthy=healthy)
             else:
-                with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
-                    client.close()
+                _ddg_pool.release(client, healthy=healthy)
 
 
 def _fetch_wikipedia(
@@ -269,19 +353,15 @@ def _fetch_wikipedia(
     timeout_s: float,
     cancel_group: _CancelGroup | None = None,
 ) -> list[str]:
-    headers = {"User-Agent": "IOGHAL-Voice-Runtime/1.0 (local research client)"}
     client: httpx.Client | None = None
+    healthy = False
     try:
         if cancel_group is not None:
-            client = cancel_group.create_client(timeout_s=timeout_s, headers=headers)
+            client = cancel_group.acquire_client(_wiki_pool, timeout_s=timeout_s)
             if client is None:
                 return []
         else:
-            client = httpx.Client(
-                timeout=httpx.Timeout(connect=2.0, read=timeout_s, write=2.0, pool=2.0),
-                follow_redirects=True,
-                headers=headers,
-            )
+            client = _wiki_pool.acquire(timeout_s=timeout_s)
         resp = client.get(
             "https://en.wikipedia.org/w/api.php",
             params={
@@ -294,11 +374,13 @@ def _fetch_wikipedia(
             },
         )
         if resp.status_code != 200:
+            healthy = True
             return []
         if cancel_group is not None and cancel_group.is_cancelled():
             return []
         hits = resp.json().get("query", {}).get("search", [])
         if not hits:
+            healthy = True
             return []
         top_title = hits[0].get("title", "")
         results: list[str] = []
@@ -310,6 +392,7 @@ def _fetch_wikipedia(
                 extract = (sum_resp.json().get("extract") or "").strip()
                 if extract:
                     results.append(f"Wikipedia ({top_title}): {extract[:460]}")
+        healthy = True
         for h in hits:
             title = h.get("title", "")
             snip = re.sub(r"<[^>]+>", "", h.get("snippet", ""))
@@ -323,10 +406,9 @@ def _fetch_wikipedia(
     finally:
         if client is not None:
             if cancel_group is not None:
-                cancel_group.release_client(client)
+                cancel_group.release_client(client, pool=_wiki_pool, healthy=healthy)
             else:
-                with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
-                    client.close()
+                _wiki_pool.release(client, healthy=healthy)
 
 
 def _is_rich_wiki_summary(wiki_res: list[str]) -> bool:
@@ -338,7 +420,7 @@ def search_web_context(
     *,
     cancel_event: threading.Event | None = None,
     timeout_s: float = 3.5,
-    ddg_grace_s: float = _DDG_GRACE_AFTER_WIKI_S,
+    ddg_grace_s: float | None = None,
     cache_ttl_s: float = _CACHE_TTL_S,
 ) -> str:
     """Query Wikipedia and DuckDuckGo Lite in parallel with immediate cancel, racing, and TTL cache."""
@@ -352,6 +434,12 @@ def search_web_context(
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+
+    effective_ddg_grace = (
+        ddg_grace_s
+        if ddg_grace_s is not None
+        else (_DDG_GRACE_AFTER_WIKI_S if _is_recency_query(user_text) else _DDG_GRACE_EVERGREEN_S)
+    )
 
     group = _CancelGroup(cancel_event)
     cond = threading.Condition()
@@ -400,7 +488,7 @@ def search_web_context(
                 break
             now = time.monotonic()
             if wiki_done and ddg_deadline is None and _is_rich_wiki_summary(wiki_res):
-                ddg_deadline = min(deadline, now + max(0.0, ddg_grace_s))
+                ddg_deadline = min(deadline, now + max(0.0, effective_ddg_grace))
             effective_deadline = min(deadline, ddg_deadline) if ddg_deadline is not None else deadline
             remaining = effective_deadline - now
             if remaining <= 0:

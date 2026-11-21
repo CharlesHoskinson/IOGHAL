@@ -49,6 +49,7 @@ module glimmer_runtime {
 
   type SlotHolder =
     | SlotFree
+    | SlotWarmup
     | SlotBusy({ clientId: int, gen: int, backend: Backend, zombie: bool })
 
   type WarmupReq = { seq: int, model: ModelId }
@@ -128,6 +129,7 @@ module glimmer_runtime {
     llmHttp500Recovered: bool,
     llmMidStreamDisconnectRecovered: bool,
     scopedRetiredCancelVerified: bool,
+    llamaWarmupCancelledByFirstTurn: bool,
   }
 
   pure val fixedConfig: RuntimeConfig = {
@@ -189,19 +191,28 @@ module glimmer_runtime {
   pure def isZombieSlot(s: SlotHolder): bool =
     match s {
       | SlotBusy(b) => b.zombie
+      | SlotWarmup => false
       | SlotFree => false
     }
 
   pure def isSlotHeldBy(s: SlotHolder, cid: int, g: int): bool =
     match s {
       | SlotBusy(b) => b.clientId == cid and b.gen == g and not(b.zombie)
+      | SlotWarmup => false
       | SlotFree => false
     }
 
   pure def isSlotFree(s: SlotHolder): bool =
     match s {
       | SlotFree => true
+      | SlotWarmup => false
       | SlotBusy(_) => false
+    }
+
+  pure def isSlotWarmup(s: SlotHolder): bool =
+    match s {
+      | SlotWarmup => true
+      | _ => false
     }
 
   var cfg: RuntimeConfig
@@ -281,6 +292,7 @@ module glimmer_runtime {
     llmHttp500Recovered: false,
     llmMidStreamDisconnectRecovered: false,
     scopedRetiredCancelVerified: false,
+    llamaWarmupCancelledByFirstTurn: false,
   }
 
   action initBase(c: RuntimeConfig, startModel: ModelId, startCuda: CudaState): bool = all {
@@ -328,8 +340,9 @@ module glimmer_runtime {
     val allowedTarget =
       target != ModelNone and
       (not(cfg.enforceBackendExclusivity) or targetBackend != BackendOllama or modelMemGb(target) <= OLLAMA_CGROUP_MAX_GB)
-    // Under fixed config, backend switch waits for LLM slot to be idle so Tab 2 cannot evict Tab 1 mid-turn
-    val slotReady = not(cfg.enforceBackendExclusivity) or isSlotFree(llmSlot)
+    // Under fixed config, backend switch waits for LLM slot to be idle (cancelling any warmup probe)
+    val slotReady = not(cfg.enforceBackendExclusivity) or isSlotFree(llmSlot) or isSlotWarmup(llmSlot)
+    val nextSlotAfterSwitch = if (isSlotWarmup(llmSlot)) SlotFree else llmSlot
     val nextSeq = warmupSeq + 1
     // Switching backend updates residency cleanly when enforceBackendExclusivity is true
     val nextOllama =
@@ -374,7 +387,7 @@ module glimmer_runtime {
       pendingWarmups' = nextWarmups,
       dualBackendCollision' = (dualBackendCollision or collisionNow),
       ollamaCgroupOom' = ollamaCgroupOom,
-      llmSlot' = llmSlot,
+      llmSlot' = nextSlotAfterSwitch,
       history' = history,
       lastKvPromptTag' = if (target != activeGlobalModel) 0 else lastKvPromptTag,
       kvModeInvalidations' = kvModeInvalidations,
@@ -444,11 +457,13 @@ module glimmer_runtime {
       } else {
         t.selectedModel
       }
-    // Cancelling any prior active turn on `id` frees its HTTP stream if it was already open
+    // Cancelling any prior active turn or boot/switch llama-server KV warmup frees llmSlot immediately
+    val cancelledWarmup = isSlotWarmup(llmSlot)
     val nextSlot = match llmSlot {
       | SlotBusy(b) =>
           if (b.clientId == id and b.gen == t.workerGen) SlotFree
           else llmSlot
+      | SlotWarmup => SlotFree
       | SlotFree => SlotFree
     }
     val wasThinking = t.phase == PhaseThinkingSelf
@@ -494,6 +509,7 @@ module glimmer_runtime {
       cov' = {
         ...cov,
         bargeInDuringThinking: cov.bargeInDuringThinking or wasThinking,
+        llamaWarmupCancelledByFirstTurn: cov.llamaWarmupCancelledByFirstTurn or cancelledWarmup,
       },
     }
   }
@@ -939,6 +955,7 @@ module glimmer_runtime {
         if (cfg.pipelineCancelsLlmOnFailure) SlotFree
         else match llmSlot {
           | SlotBusy(b) => SlotBusy({ ...b, zombie: true })
+          | SlotWarmup => SlotWarmup
           | SlotFree => SlotFree
         }
       } else llmSlot
@@ -990,6 +1007,7 @@ module glimmer_runtime {
       | SlotBusy(b) =>
           if (b.clientId == id and b.gen == t.workerGen) SlotFree
           else llmSlot
+      | SlotWarmup => SlotWarmup
       | SlotFree => SlotFree
     }
     val updatedHistory =
@@ -1042,6 +1060,7 @@ module glimmer_runtime {
       | SlotBusy(b) =>
           if (b.clientId == id and b.gen == t.workerGen) SlotFree
           else llmSlot
+      | SlotWarmup => SlotWarmup
       | SlotFree => SlotFree
     }
     all {
@@ -1363,6 +1382,56 @@ module glimmer_runtime {
     unchangedNonCudaState,
   }
 
+  // Background boot/switch llama-server KV prefix warmup (`server.py:_warmup_ollama_async`).
+  action llamaWarmupStart: bool = all {
+    llamaServerLoaded != ModelNone,
+    isSlotFree(llmSlot),
+    llmSlot' = SlotWarmup,
+    turns' = turns,
+    ollamaLoaded' = ollamaLoaded,
+    llamaServerLoaded' = llamaServerLoaded,
+    activeGlobalModel' = activeGlobalModel,
+    warmupSeq' = warmupSeq,
+    pendingWarmups' = pendingWarmups,
+    history' = history,
+    lastKvPromptTag' = lastKvPromptTag,
+    kvModeInvalidations' = kvModeInvalidations,
+    modeSwitchReloads' = modeSwitchReloads,
+    staleWarmupEvictions' = staleWarmupEvictions,
+    silentEmptyDrops' = silentEmptyDrops,
+    ollamaCgroupOom' = ollamaCgroupOom,
+    dualBackendCollision' = dualBackendCollision,
+    atemLeakedToTts' = atemLeakedToTts,
+    activePoolCrossKilled' = activePoolCrossKilled,
+    cfg' = cfg,
+    cuda' = cuda,
+    cov' = cov,
+  }
+
+  action llamaWarmupFinish: bool = all {
+    isSlotWarmup(llmSlot),
+    llmSlot' = SlotFree,
+    lastKvPromptTag' = 1,
+    turns' = turns,
+    ollamaLoaded' = ollamaLoaded,
+    llamaServerLoaded' = llamaServerLoaded,
+    activeGlobalModel' = activeGlobalModel,
+    warmupSeq' = warmupSeq,
+    pendingWarmups' = pendingWarmups,
+    history' = history,
+    kvModeInvalidations' = kvModeInvalidations,
+    modeSwitchReloads' = modeSwitchReloads,
+    staleWarmupEvictions' = staleWarmupEvictions,
+    silentEmptyDrops' = silentEmptyDrops,
+    ollamaCgroupOom' = ollamaCgroupOom,
+    dualBackendCollision' = dualBackendCollision,
+    atemLeakedToTts' = atemLeakedToTts,
+    activePoolCrossKilled' = activePoolCrossKilled,
+    cfg' = cfg,
+    cuda' = cuda,
+    cov' = cov,
+  }
+
   action executeAnyOllamaWarmup: bool = {
     nondet req = pendingWarmups.oneOf()
     executeOllamaWarmup(req)
@@ -1376,6 +1445,8 @@ module glimmer_runtime {
     any {
       clientSetModel(id, m),
       executeAnyOllamaWarmup,
+      llamaWarmupStart,
+      llamaWarmupFinish,
       startTurn(id, mode),
       cancelInPreStream(id),
       llmOpenStream(id),
@@ -1499,4 +1570,5 @@ module glimmer_runtime {
   val wLlmHttp500Recovered: bool = cov.llmHttp500Recovered
   val wLlmMidStreamDisconnectRecovered: bool = cov.llmMidStreamDisconnectRecovered
   val wScopedRetiredCancelVerified: bool = cov.scopedRetiredCancelVerified
+  val wLlamaWarmupCancelledByFirstTurn: bool = cov.llamaWarmupCancelledByFirstTurn
 }

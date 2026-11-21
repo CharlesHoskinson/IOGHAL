@@ -31,6 +31,9 @@ export interface HalMetricsMessage {
   stt_s: number;
   first_chunk_s: number;
   rtf?: number;
+  web_search_s?: number;
+  llm_first_sentence_s?: number;
+  tts_first_chunk_s?: number;
 }
 
 export type ServerMessage =
@@ -51,7 +54,8 @@ export type ServerMessage =
 // with 3x headroom while widening automatically to 300ms if a genuine underrun occurs.
 const INITIAL_PREBUFFER_SEC = 0.15;
 const REBUFFER_PREBUFFER_SEC = 0.30;
-const SCHEDULE_LEAD_SEC = 0.015;
+// 8ms = 3 WebAudio render quanta @ 48 kHz (2.67ms each): tight start with zero underrun risk.
+const SCHEDULE_LEAD_SEC = 0.008;
 const PCM_HEADER_BYTES = 4;
 
 /** Parse a binary WebSocket PCM frame prefixed with a 4-byte little-endian uint32 turn_id. */
@@ -61,8 +65,8 @@ export function decodeFramedPcm(buffer: ArrayBuffer): { turnId: number; pcm: Flo
   if (payloadBytes % 4 !== 0) return null;
   const view = new DataView(buffer);
   const turnId = view.getUint32(0, true);
-  // Copy into aligned Float32Array slice
-  const pcm = new Float32Array(buffer.slice(PCM_HEADER_BYTES));
+  // Zero-copy aligned Float32Array view (PCM_HEADER_BYTES === 4 is Float32-aligned)
+  const pcm = new Float32Array(buffer, PCM_HEADER_BYTES, payloadBytes / 4);
   return { turnId, pcm };
 }
 
@@ -271,11 +275,16 @@ export class HalAudioPlayer {
       this.callbacks.onSuspendedChange(true);
       return;
     }
-    const merged = new Float32Array(this.prebufferSamples);
-    let offset = 0;
-    for (const chunk of this.prebuffer) {
-      merged.set(chunk, offset);
-      offset += chunk.length;
+    let merged: Float32Array;
+    if (this.prebuffer.length === 1) {
+      merged = this.prebuffer[0];
+    } else {
+      merged = new Float32Array(this.prebufferSamples);
+      let offset = 0;
+      for (const chunk of this.prebuffer) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      }
     }
     this.prebuffer = [];
     this.prebufferSamples = 0;
