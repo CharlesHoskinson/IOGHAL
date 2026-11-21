@@ -524,7 +524,20 @@ class TestPipelineAndServer(unittest.TestCase):
         self.assertFalse(should_use_low_think("Tell me about Discovery One."))
         self.assertTrue(should_use_low_think("Calculate 42 * 19 + 7 for me."))
         self.assertTrue(should_use_low_think("Compare orbital mechanics and compare trade-offs."))
-        self.assertTrue(should_use_low_think("Good afternoon", extra_context="Wikipedia: ..."))
+        # Grounded web-search facts use instant Zero-Think unless the query itself needs reasoning
+        self.assertFalse(
+            should_use_low_think(
+                "Search online to see if the Riemann hypothesis has been solved.",
+                extra_context="Wikipedia (Riemann hypothesis): remains unsolved.",
+            )
+        )
+        self.assertFalse(should_use_low_think("Good afternoon", extra_context="Wikipedia: ..."))
+        self.assertTrue(
+            should_use_low_think(
+                "Compare the current market caps of Bitcoin and Ethereum.",
+                extra_context="Wikipedia: ...",
+            )
+        )
         self.assertFalse(should_use_low_think("Calculate 42 * 19", thinking_mode="off"))
         self.assertTrue(should_use_low_think("Hi", thinking_mode="low"))
 
@@ -541,6 +554,76 @@ class TestPipelineAndServer(unittest.TestCase):
         )
         self.assertEqual(clause3, "I am functioning completely within all normal operational parameters right now,")
         self.assertEqual(rem3, "and every sensor reads nominal.")
+
+    def test_lore_index_compact_prefill_budget_and_marginal_coverage(self) -> None:
+        lore = LoreIndex()
+        mono = lore.lookup("What is the monolith, Hal, and what are its exact dimensions?")
+        self.assertIn("monolith", mono.lower())
+        # Single-topic query picks 1 compact section instead of two bloated 1100-char sections
+        self.assertEqual(mono.count("\n["), 0)
+        self.assertLessEqual(len(mono), LoreIndex._MAX_SECTION_CHARS + 80)
+
+        leonov = lore.lookup("Tell me about the Alexei Leonov and what happened to Jupiter.")
+        self.assertIn("leonov", leonov.lower())
+        self.assertIn("jupiter", leonov.lower())
+        self.assertLessEqual(len(leonov), LoreIndex._MAX_TOTAL_CHARS + 32)
+        self.assertNotIn("**", leonov)
+
+    def test_persistent_http_client_reuse_and_atomic_cancel_replacement(self) -> None:
+        created: list[object] = []
+        closed: list[object] = []
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def iter_lines(self):
+                yield 'data: {"choices":[{"delta":{"content":"All systems nominal."},"finish_reason":"stop"}]}'
+                yield "data: [DONE]"
+
+        class _PooledFakeClient:
+            def __init__(self, *args, **kwargs) -> None:
+                self.is_closed = False
+                created.append(self)
+
+            def stream(self, method: str, url: str, json: dict):
+                return _FakeResp()
+
+            def close(self) -> None:
+                self.is_closed = True
+                closed.append(self)
+
+        brain = OllamaBrain(
+            model="muse-glimmer-30b-dflash",
+            backend="llama_server",
+            llama_server_url="http://127.0.0.1:8080",
+            llama_server_models={"muse-glimmer-30b-dflash"},
+        )
+        with patch("hal9000.brain.httpx.Client", _PooledFakeClient):
+            r1 = list(brain.stream_reply_sentences("Hello HAL."))
+            r2 = list(brain.stream_reply_sentences("How are you?"))
+            self.assertEqual(r1, ["All systems nominal."])
+            self.assertEqual(r2, ["All systems nominal."])
+            # Keep-alive client reused across consecutive healthy turns
+            self.assertEqual(len(created), 1)
+            self.assertEqual(len(closed), 0)
+
+            # Barge-in cancel_inflight immediately closes pooled client; next turn allocates a fresh one
+            brain.cancel_inflight()
+            self.assertEqual(len(closed), 1)
+            self.assertTrue(created[0].is_closed)
+
+            r3 = list(brain.stream_reply_sentences("Status report."))
+            self.assertEqual(r3, ["All systems nominal."])
+            self.assertEqual(len(created), 2)
+            brain.close()
+            self.assertEqual(len(closed), 2)
 
     def test_atem_think_stripper_cross_chunk_boundaries(self) -> None:
         """Quint Bug 3b regression: raw ATEM to=self spans split across chunks never leak to TTS."""

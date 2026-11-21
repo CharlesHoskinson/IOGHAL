@@ -352,6 +352,10 @@ class LoreIndex:
         }
     )
 
+    _MAX_SECTION_CHARS = 560
+    _MAX_TOTAL_CHARS = 960
+    _MD_FMT_RE = re.compile(r"[*_`>]+")
+
     def __init__(self, lore_dir: Path | None = None) -> None:
         self._sections: list[tuple[str, str, set[str], set[str]]] = []
         root = lore_dir or DEFAULT_LORE_DIR
@@ -362,18 +366,53 @@ class LoreIndex:
             if path.is_file():
                 self._index_markdown(path.read_text(encoding="utf-8", errors="ignore"))
 
+    @classmethod
+    def _compact_body(cls, body: str, max_chars: int = _MAX_SECTION_CHARS) -> str:
+        cleaned_lines: list[str] = []
+        for raw in body.splitlines():
+            line = raw.strip()
+            if not line or line == "---":
+                continue
+            if line.startswith(("* ", "- ")):
+                line = line[2:].strip()
+            line = cls._MD_FMT_RE.sub("", line)
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                cleaned_lines.append(line)
+        compact = "\n".join(cleaned_lines)
+        if len(compact) <= max_chars:
+            return compact
+        # Prefer cutting cleanly at a line break or non-abbreviation sentence boundary
+        window = compact[:max_chars]
+        nl_cut = window.rfind("\n")
+        if nl_cut >= max_chars // 2:
+            return window[:nl_cut].rstrip()
+        for match in reversed(list(re.finditer(r"[.!?](?:\s+|$)", window))):
+            pos = match.start()
+            if pos < max_chars // 2:
+                break
+            token = window[: pos + 1].rsplit(None, 1)[-1].strip("\"'”’([{)]}").lower()
+            if token not in _ABBREVIATIONS:
+                return window[: pos + 1].rstrip()
+        space_cut = window.rfind(" ")
+        return (window[:space_cut] if space_cut > 0 else window).rstrip()
+
     def _index_markdown(self, content: str) -> None:
         heading = "Overview"
         lines: list[str] = []
 
         def flush() -> None:
-            body = "\n".join(lines).strip()
+            raw_body = "\n".join(lines).strip()
+            if len(raw_body) < 40:
+                return
+            body = self._compact_body(raw_body, self._MAX_SECTION_CHARS)
             if len(body) < 40:
                 return
-            h_tokens = self._tokenize(heading)
-            tokens = self._tokenize(f"{heading} {body}")
+            clean_heading = self._MD_FMT_RE.sub("", heading).strip()
+            h_tokens = self._tokenize(clean_heading)
+            tokens = self._tokenize(f"{clean_heading} {body}")
             if tokens:
-                self._sections.append((heading, body[:1100], tokens, h_tokens))
+                self._sections.append((clean_heading, body, tokens, h_tokens))
 
         for line in content.splitlines():
             if line.startswith("#"):
@@ -397,12 +436,12 @@ class LoreIndex:
         return out
 
     def lookup(self, query: str, max_sections: int = 2) -> str:
-        if not self._sections:
+        if not self._sections or max_sections <= 0:
             return ""
         q_tokens = self._tokenize(query)
         if not q_tokens:
             return ""
-        scored: list[tuple[int, str, str]] = []
+        candidates: list[tuple[int, str, str, set[str], set[str]]] = []
         for heading, body, s_tokens, h_tokens in self._sections:
             matched = q_tokens & s_tokens
             if not matched:
@@ -412,12 +451,50 @@ class LoreIndex:
             key_hits = len(matched & self._KEY_LORE_TERMS)
             score = overlap + heading_hits * 2 + key_hits * 2
             if key_hits >= 1 or score >= 5:
-                scored.append((score, heading, body))
-        if not scored:
+                candidates.append((score, heading, body, matched, h_tokens))
+        if not candidates:
             return ""
-        scored.sort(key=lambda item: item[0], reverse=True)
-        picked = scored[:max_sections]
-        return "\n\n".join(f"[{h}]\n{b}" for _, h, b in picked)
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        picked: list[tuple[str, str]] = []
+        covered: set[str] = set()
+        total_chars = 0
+
+        _, top_heading, top_body, top_matched, _ = candidates[0]
+        picked.append((top_heading, top_body))
+        covered.update(top_matched)
+        total_chars += len(top_heading) + len(top_body) + 4
+
+        remaining = candidates[1:]
+        while len(picked) < max_sections and remaining:
+            # Only add another section when it covers query terms not already in picked sections
+            best_idx = -1
+            best_key = (0, 0)
+            for idx, (score, _h, _b, matched, h_tokens) in enumerate(remaining):
+                new_hits = matched - covered
+                if not new_hits:
+                    continue
+                new_key_hits = len(new_hits & self._KEY_LORE_TERMS)
+                new_heading_hits = len(new_hits & h_tokens)
+                marginal = len(new_hits) + new_heading_hits * 2 + new_key_hits * 2
+                rank = (marginal, score)
+                if rank > best_key:
+                    best_key = rank
+                    best_idx = idx
+            if best_idx == -1:
+                break
+            _, heading, body, matched, _ = remaining.pop(best_idx)
+            budget = self._MAX_TOTAL_CHARS - total_chars - len(heading) - 6
+            if budget < 180:
+                break
+            trimmed = body if len(body) <= budget else self._compact_body(body, budget)
+            if not trimmed:
+                break
+            picked.append((heading, trimmed))
+            covered.update(matched)
+            total_chars += len(heading) + len(trimmed) + 6
+
+        return "\n\n".join(f"[{h}]\n{b}" for h, b in picked)
 
 
 def list_ollama_models(base_url: str = "http://127.0.0.1:11434") -> list[str]:
@@ -495,13 +572,12 @@ def should_use_low_think(
     extra_context: str | None = None,
     thinking_mode: str = "auto",
 ) -> bool:
-    """Dual-mode router: instant zero-think for casual chat/lore vs low-think for synthesis/math/analysis."""
+    """Dual-mode router: instant zero-think for casual/lore/grounded lookups vs low-think for math/analysis."""
+    _ = extra_context
     mode = (thinking_mode or "auto").lower()
     if mode == "off":
         return False
     if mode == "low":
-        return True
-    if extra_context:
         return True
     text = user_text.strip()
     if len(text) >= 180 or len(text.split()) >= 30:
@@ -595,7 +671,8 @@ class OllamaBrain:
         self._lore = lore_index if lore_index is not None else LoreIndex(lore_dir)
         self._lock = threading.Lock()
         self._history_gen = 0
-        self._active_clients: set[httpx.Client] = set()
+        self._http_client: httpx.Client | None = None
+        self._active_clients: dict[httpx.Client, int] = {}
 
     def get_model(self) -> str:
         with self._lock:
@@ -617,11 +694,52 @@ class OllamaBrain:
     def _llama_endpoint_base(self) -> str:
         return (self.llama_server_url or self.base_url).rstrip("/")
 
+    def _acquire_http_client(
+        self, stop_check: Callable[[], bool] | None = None
+    ) -> httpx.Client | None:
+        """Return a warm keep-alive client or abort atomically if ``stop_check`` is already set."""
+        with self._lock:
+            if stop_check is not None and stop_check():
+                return None
+            client = self._http_client
+            if client is None or getattr(client, "is_closed", False):
+                client = httpx.Client(
+                    timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0),
+                    limits=httpx.Limits(
+                        max_keepalive_connections=4,
+                        max_connections=8,
+                        keepalive_expiry=60.0,
+                    ),
+                )
+                self._http_client = client
+            self._active_clients[client] = self._active_clients.get(client, 0) + 1
+            return client
+
+    def _release_http_client(self, client: httpx.Client, *, healthy: bool) -> None:
+        with self._lock:
+            remaining = self._active_clients.get(client, 0) - 1
+            if remaining <= 0:
+                self._active_clients.pop(client, None)
+            else:
+                self._active_clients[client] = remaining
+            if not healthy and self._http_client is client:
+                self._http_client = None
+            should_close = (client is not self._http_client) and (
+                client not in self._active_clients
+            )
+        if should_close:
+            with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
+                client.close()
+
     def cancel_inflight(self) -> None:
         """Abort any active LLM HTTP streams (including KV warmup) immediately on barge-in or disconnect."""
         with self._lock:
-            clients = list(self._active_clients)
+            clients = list(self._active_clients.keys())
             self._active_clients.clear()
+            pooled = self._http_client
+            self._http_client = None
+            if pooled is not None and pooled not in clients:
+                clients.append(pooled)
         for client in clients:
             with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
                 client.close()
@@ -706,23 +824,19 @@ class OllamaBrain:
         if is_glimmer:
             payload["reasoning_format"] = "deepseek"
 
-        client = httpx.Client(timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0))
-        with self._lock:
-            if stop_check is not None and stop_check():
-                client.close()
-                return False
-            self._active_clients.add(client)
+        client = self._acquire_http_client(stop_check)
+        if client is None:
+            return False
+        healthy = False
         try:
             resp = client.post(endpoint, json=payload)
             resp.raise_for_status()
+            healthy = True
             return True
         except (httpx.HTTPError, OSError):
             return False
         finally:
-            with self._lock:
-                self._active_clients.discard(client)
-            with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
-                client.close()
+            self._release_http_client(client, healthy=healthy)
 
     def _build_messages(
         self,
@@ -842,16 +956,11 @@ class OllamaBrain:
         done_seen = False
         reasoning_seen = False
 
-        client = httpx.Client(
-            timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
-        )
-        # Quint Bug 2a fix: check stop_check() atomically under self._lock before registering client
+        # Quint Bug 2a fix: check stop_check() atomically under self._lock before acquiring client
         # so a cancelled turn can never open a zombie stream on llama-server --parallel 1.
-        with self._lock:
-            if stop_check is not None and stop_check():
-                client.close()
-                return [], False, False
-            self._active_clients.add(client)
+        client = self._acquire_http_client(stop_check)
+        if client is None:
+            return [], False, False
 
         def _emit_chunk(raw_text: str) -> str | None:
             cleaned = enforce_user_address(clean_for_speech(raw_text), self.user_name)
@@ -860,6 +969,7 @@ class OllamaBrain:
                 return cleaned
             return None
 
+        stream_healthy = False
         try:
             with client.stream("POST", url, json=payload) as resp:
                 resp.raise_for_status()
@@ -920,15 +1030,13 @@ class OllamaBrain:
 
                     if not use_llama_server and done_seen:
                         break
+            stream_healthy = done_seen and not (stop_check is not None and stop_check())
         except (httpx.HTTPError, RuntimeError, OSError, ValueError):
             if stop_check is not None and stop_check():
                 return full_parts, False, reasoning_seen
             raise
         finally:
-            with self._lock:
-                self._active_clients.discard(client)
-            with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
-                client.close()
+            self._release_http_client(client, healthy=stream_healthy)
 
         if stop_check is not None and stop_check():
             return full_parts, False, reasoning_seen
