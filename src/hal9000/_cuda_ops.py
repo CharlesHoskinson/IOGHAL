@@ -40,6 +40,55 @@ try:
         tl.store(y_ptr + row * stride_y + cols, q, mask=mask)
 
     @triton.jit
+    def _rmsnorm_rowwise_fp8_quant_kernel(
+        x_ptr,
+        w_ptr,
+        y_ptr,
+        s_ptr,
+        n_cols,
+        stride_x,
+        stride_y,
+        EPS: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        mean_sq = tl.sum(x * x, axis=0) / n_cols
+        rstd = tl.rsqrt(mean_sq + EPS)
+        normed = (x * rstd) * w
+        amax = tl.max(tl.abs(normed), axis=0)
+        scale = tl.maximum(amax, 1e-12) / 448.0
+        tl.store(s_ptr + row, scale)
+        q = tl.clamp(normed / scale, -448.0, 448.0).to(tl.float8e4nv)
+        tl.store(y_ptr + row * stride_y + cols, q, mask=mask)
+
+    @triton.jit
+    def _silu_mul_rowwise_fp8_quant_kernel(
+        gu_ptr,
+        y_ptr,
+        s_ptr,
+        n_cols,
+        stride_gu,
+        stride_y,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        row_ptr = gu_ptr + row * stride_gu
+        g = tl.load(row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(row_ptr + n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+        act = (g * tl.sigmoid(g)) * u
+        amax = tl.max(tl.abs(act), axis=0)
+        scale = tl.maximum(amax, 1e-12) / 448.0
+        tl.store(s_ptr + row, scale)
+        q = tl.clamp(act / scale, -448.0, 448.0).to(tl.float8e4nv)
+        tl.store(y_ptr + row * stride_y + cols, q, mask=mask)
+
+    @triton.jit
     def _int4_gemv_splitk_kernel(
         x_ptr,
         qw_ptr,
@@ -113,6 +162,61 @@ def quantize_rowwise_fp8(x2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return y, s
 
 
+def rmsnorm_quantize_rowwise_fp8(
+    x2d: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m_rows, n_cols = x2d.shape
+    x2d = x2d.contiguous()
+    if TRITON_AVAILABLE and x2d.is_cuda:
+        block = triton.next_power_of_2(n_cols)
+        if block <= 8192:
+            w = weight.contiguous()
+            y = torch.empty((m_rows, n_cols), device=x2d.device, dtype=torch.float8_e4m3fn)
+            s = torch.empty((m_rows, 1), device=x2d.device, dtype=torch.float32)
+            _rmsnorm_rowwise_fp8_quant_kernel[(m_rows,)](
+                x2d,
+                w,
+                y,
+                s,
+                n_cols,
+                x2d.stride(0),
+                y.stride(0),
+                EPS=float(eps),
+                BLOCK_SIZE=block,
+                num_warps=8 if block >= 4096 else 4,
+            )
+            return y, s
+    xf = x2d.float()
+    normed = (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)).to(x2d.dtype) * weight
+    return quantize_rowwise_fp8(normed)
+
+
+def silu_mul_quantize_rowwise_fp8(gu2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    m_rows, two_n = gu2d.shape
+    n_cols = two_n // 2
+    gu2d = gu2d.contiguous()
+    if TRITON_AVAILABLE and gu2d.is_cuda:
+        block = triton.next_power_of_2(n_cols)
+        if block <= 8192:
+            y = torch.empty((m_rows, n_cols), device=gu2d.device, dtype=torch.float8_e4m3fn)
+            s = torch.empty((m_rows, 1), device=gu2d.device, dtype=torch.float32)
+            _silu_mul_rowwise_fp8_quant_kernel[(m_rows,)](
+                gu2d,
+                y,
+                s,
+                n_cols,
+                gu2d.stride(0),
+                y.stride(0),
+                BLOCK_SIZE=block,
+                num_warps=8 if block >= 4096 else 4,
+            )
+            return y, s
+    g, u = gu2d.chunk(2, dim=-1)
+    return quantize_rowwise_fp8(F.silu(g) * u)
+
+
 class FP8Linear(nn.Module):
     """Native CUDA FP8 (float8_e4m3fn) linear layer backed by ``torch._scaled_mm``."""
 
@@ -133,9 +237,12 @@ class FP8Linear(nn.Module):
         else:
             self.bias = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_shape = x.shape
-        x_fp8, x_scale = quantize_rowwise_fp8(x.reshape(-1, self.in_features))
+    def forward_prequant(
+        self,
+        x_fp8: torch.Tensor,
+        x_scale: torch.Tensor,
+        orig_prefix_shape: tuple[int, ...],
+    ) -> torch.Tensor:
         out = torch._scaled_mm(
             x_fp8,
             self.w_t,
@@ -144,7 +251,31 @@ class FP8Linear(nn.Module):
             bias=self.bias,
             out_dtype=torch.bfloat16,
         )
-        return out.view(*orig_shape[:-1], self.out_features)
+        return out.view(*orig_prefix_shape, self.out_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x_fp8, x_scale = quantize_rowwise_fp8(x.reshape(-1, self.in_features))
+        return self.forward_prequant(x_fp8, x_scale, orig_shape[:-1])
+
+    def forward_rmsnorm(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        orig_shape = x.shape
+        x_fp8, x_scale = rmsnorm_quantize_rowwise_fp8(
+            x.reshape(-1, self.in_features), weight, eps
+        )
+        return self.forward_prequant(x_fp8, x_scale, orig_shape[:-1])
+
+    def forward_silu_mul(self, gate_up: torch.Tensor) -> torch.Tensor:
+        orig_shape = gate_up.shape
+        x_fp8, x_scale = silu_mul_quantize_rowwise_fp8(
+            gate_up.reshape(-1, self.in_features * 2)
+        )
+        return self.forward_prequant(x_fp8, x_scale, orig_shape[:-1])
 
 
 class Int4Linear(nn.Module):

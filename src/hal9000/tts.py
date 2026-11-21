@@ -207,9 +207,12 @@ def _fuse_minicpm_model(
         attn._q_dim = attn.num_heads * attn.head_dim
         attn._kv_dim = attn.num_key_value_heads * attn.head_dim
 
-        def fused_forward(self, hidden_states, position_emb, is_causal):
+        def fused_forward(self, hidden_states, position_emb, is_causal, norm_weight=None, norm_eps=1e-6):
             bsz, q_len, _ = hidden_states.size()
-            qkv = self.qkv_proj(hidden_states)
+            if norm_weight is not None:
+                qkv = self.qkv_proj.forward_rmsnorm(hidden_states, norm_weight, norm_eps)
+            else:
+                qkv = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self._q_dim, self._kv_dim, self._kv_dim], dim=-1)
             q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             k = k.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -226,9 +229,21 @@ def _fuse_minicpm_model(
         attn.forward = types.MethodType(fused_forward, attn)
 
         if arange_buf is not None:
-            def fused_step(self, hidden_states, position_emb, position_id, kv_cache, _arange=arange_buf):
+            def fused_step(
+                self,
+                hidden_states,
+                position_emb,
+                position_id,
+                kv_cache,
+                norm_weight=None,
+                norm_eps=1e-6,
+                _arange=arange_buf,
+            ):
                 bsz, _ = hidden_states.size()
-                qkv = self.qkv_proj(hidden_states)
+                if norm_weight is not None:
+                    qkv = self.qkv_proj.forward_rmsnorm(hidden_states, norm_weight, norm_eps)
+                else:
+                    qkv = self.qkv_proj(hidden_states)
                 q, k, v = qkv.split([self._q_dim, self._kv_dim, self._kv_dim], dim=-1)
                 q = q.view(bsz, 1, self.num_heads, self.head_dim).transpose(1, 2)
                 k = k.view(bsz, 1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -255,11 +270,122 @@ def _fuse_minicpm_model(
         mlp.down_proj = FP8Linear(mlp.down_proj.weight)
         del mlp.gate_proj, mlp.up_proj
 
-        def fast_mlp(self, x):
-            g, u = self.gate_up_proj(x).chunk(2, dim=-1)
-            return self.down_proj(self.act_fn(g) * u)
+        qkv_is_fp8 = isinstance(attn.qkv_proj, FP8Linear)
+        gu_is_fp8 = isinstance(mlp.gate_up_proj, FP8Linear)
+        down_is_fp8 = isinstance(mlp.down_proj, FP8Linear)
+
+        if down_is_fp8:
+            def fast_mlp(self, x):
+                return self.down_proj.forward_silu_mul(self.gate_up_proj(x))
+        else:
+            def fast_mlp(self, x):
+                g, u = self.gate_up_proj(x).chunk(2, dim=-1)
+                return self.down_proj(self.act_fn(g) * u)
 
         mlp.forward = types.MethodType(fast_mlp, mlp)
+
+        if gu_is_fp8 and down_is_fp8:
+            def fast_mlp_rmsnorm(self, x, norm_weight, norm_eps):
+                return self.down_proj.forward_silu_mul(
+                    self.gate_up_proj.forward_rmsnorm(x, norm_weight, norm_eps)
+                )
+
+            mlp.forward_rmsnorm = types.MethodType(fast_mlp_rmsnorm, mlp)
+
+        if qkv_is_fp8 or (gu_is_fp8 and down_is_fp8):
+            mup_scale = (
+                layer.scale_depth / (layer.num_hidden_layers**0.5)
+                if layer.use_mup
+                else None
+            )
+            in_eps = float(layer.input_layernorm.variance_epsilon)
+            post_eps = float(layer.post_attention_layernorm.variance_epsilon)
+            fuse_in_norm = qkv_is_fp8
+            fuse_post_norm = gu_is_fp8 and down_is_fp8
+
+            def fused_layer_forward(
+                self,
+                hidden_states,
+                position_emb,
+                is_causal,
+                _mup=mup_scale,
+                _in_eps=in_eps,
+                _post_eps=post_eps,
+                _fuse_in=fuse_in_norm,
+                _fuse_post=fuse_post_norm,
+            ):
+                residual = hidden_states
+                if _fuse_in:
+                    attn_out, present_kv = self.self_attn(
+                        hidden_states,
+                        position_emb,
+                        is_causal,
+                        norm_weight=self.input_layernorm.weight,
+                        norm_eps=_in_eps,
+                    )
+                else:
+                    attn_out, present_kv = self.self_attn(
+                        self.input_layernorm(hidden_states),
+                        position_emb,
+                        is_causal,
+                    )
+                hidden_states = residual + (attn_out * _mup if _mup is not None else attn_out)
+
+                residual = hidden_states
+                if _fuse_post:
+                    mlp_out = self.mlp.forward_rmsnorm(
+                        hidden_states, self.post_attention_layernorm.weight, _post_eps
+                    )
+                else:
+                    mlp_out = self.mlp(self.post_attention_layernorm(hidden_states))
+                hidden_states = residual + (mlp_out * _mup if _mup is not None else mlp_out)
+                return hidden_states, present_kv
+
+            layer.forward = types.MethodType(fused_layer_forward, layer)
+
+            if arange_buf is not None:
+                def fused_layer_step(
+                    self,
+                    hidden_states,
+                    position_emb,
+                    position_id,
+                    kv_cache,
+                    _mup=mup_scale,
+                    _in_eps=in_eps,
+                    _post_eps=post_eps,
+                    _fuse_in=fuse_in_norm,
+                    _fuse_post=fuse_post_norm,
+                ):
+                    residual = hidden_states
+                    if _fuse_in:
+                        attn_out = self.self_attn.forward_step(
+                            hidden_states,
+                            position_emb,
+                            position_id,
+                            kv_cache,
+                            norm_weight=self.input_layernorm.weight,
+                            norm_eps=_in_eps,
+                        )
+                    else:
+                        attn_out = self.self_attn.forward_step(
+                            self.input_layernorm(hidden_states),
+                            position_emb,
+                            position_id,
+                            kv_cache,
+                        )
+                    hidden_states = residual + (attn_out * _mup if _mup is not None else attn_out)
+
+                    residual = hidden_states
+                    if _fuse_post:
+                        mlp_out = self.mlp.forward_rmsnorm(
+                            hidden_states, self.post_attention_layernorm.weight, _post_eps
+                        )
+                    else:
+                        mlp_out = self.mlp(self.post_attention_layernorm(hidden_states))
+                    hidden_states = residual + (mlp_out * _mup if _mup is not None else mlp_out)
+                    return hidden_states
+
+                layer.forward_step = types.MethodType(fused_layer_step, layer)
 
 
 class _FastAudioVAEGraph:
@@ -516,9 +642,15 @@ class _MegaStepRunner:
         next_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer, (pre_k, pre_v) in zip(lm.layers, prefix_kv):
             residual = hidden_states
-            h = layer.input_layernorm(hidden_states)
             attn = layer.self_attn
-            qkv = attn.qkv_proj(h)
+            if isinstance(attn.qkv_proj, FP8Linear):
+                qkv = attn.qkv_proj.forward_rmsnorm(
+                    hidden_states,
+                    layer.input_layernorm.weight,
+                    float(layer.input_layernorm.variance_epsilon),
+                )
+            else:
+                qkv = attn.qkv_proj(layer.input_layernorm(hidden_states))
             q, k, v = qkv.split([attn._q_dim, attn._kv_dim, attn._kv_dim], dim=-1)
             q = q.view(bsz, suffix_len, attn.num_heads, attn.head_dim).transpose(1, 2)
             k = k.view(bsz, suffix_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
@@ -539,7 +671,14 @@ class _MegaStepRunner:
                 hidden_states = residual + attn_out
 
             residual = hidden_states
-            h_mlp = layer.mlp(layer.post_attention_layernorm(hidden_states))
+            if hasattr(layer.mlp, "forward_rmsnorm"):
+                h_mlp = layer.mlp.forward_rmsnorm(
+                    hidden_states,
+                    layer.post_attention_layernorm.weight,
+                    float(layer.post_attention_layernorm.variance_epsilon),
+                )
+            else:
+                h_mlp = layer.mlp(layer.post_attention_layernorm(hidden_states))
             if layer.use_mup:
                 hidden_states = residual + h_mlp * (layer.scale_depth / (layer.num_hidden_layers**0.5))
             else:
