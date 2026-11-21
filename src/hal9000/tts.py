@@ -545,6 +545,16 @@ class _MegaStepRunner:
             torch.empty(chunk_samples, dtype=torch.float32, pin_memory=True),
             torch.empty(chunk_samples, dtype=torch.float32, pin_memory=True),
         ]
+        self._latent_staging = [
+            torch.empty((1, tts_model.feat_dim, tts_model.patch_size), device=self.device, dtype=torch.float32),
+            torch.empty((1, tts_model.feat_dim, tts_model.patch_size), device=self.device, dtype=torch.float32),
+        ]
+        self._stop_staging = [
+            torch.empty((), dtype=torch.int64, pin_memory=True),
+            torch.empty((), dtype=torch.int64, pin_memory=True),
+        ]
+        self._latent_ready_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self._vae_done_events = [torch.cuda.Event(), torch.cuda.Event()]
 
     def _get_or_capture_graph(self, n_timesteps: int, cfg_value: float) -> dict:
         key = (int(n_timesteps), round(float(cfg_value), 3))
@@ -555,12 +565,14 @@ class _MegaStepRunner:
         device = self.device
         dtype = self.dtype
         h_lm = int(m.config.lm_config.hidden_size)
+        h_dit = int(m.config.dit_config.hidden_dim)
         p = m.patch_size
         d = m.feat_dim
 
-        # Static inputs/state updated in-place across autoregressive steps
-        lm_hidden = torch.zeros((1, h_lm), device=device, dtype=dtype)
-        res_hidden = torch.zeros((1, h_lm), device=device, dtype=dtype)
+        # Static inputs/state updated in-place across autoregressive steps (shared buffer for batched DiT proj)
+        lm_res_hidden = torch.zeros((2, 1, h_lm), device=device, dtype=dtype)
+        lm_hidden = lm_res_hidden[0]
+        res_hidden = lm_res_hidden[1]
         prefix_cond = torch.zeros((1, p, d), device=device, dtype=dtype)
         noise_z = torch.zeros((1, d, p), device=device, dtype=dtype)
         pos_id = torch.zeros((1,), device=device, dtype=torch.long)
@@ -575,7 +587,30 @@ class _MegaStepRunner:
         base_step = getattr(m.base_lm, "_forward_step_raw", m.base_lm.forward_step)
         res_step = getattr(m.residual_lm, "_forward_step_raw", m.residual_lm.forward_step)
 
-        mu_zeros = torch.zeros((1, int(m.config.dit_config.hidden_dim) * 2), device=device, dtype=dtype)
+        # Pre-pack lm_to_dit_proj + res_to_dit_proj into 1 exact pure-BF16 batched GEMM writing directly into mu_in[0]
+        fuse_dit_proj = isinstance(m.lm_to_dit_proj, nn.Linear) and isinstance(m.res_to_dit_proj, nn.Linear)
+        if fuse_dit_proj:
+            dit_proj_w = torch.stack(
+                (m.lm_to_dit_proj.weight.t(), m.res_to_dit_proj.weight.t()), dim=0
+            ).contiguous()
+            has_lm_b = m.lm_to_dit_proj.bias is not None
+            has_res_b = m.res_to_dit_proj.bias is not None
+            if has_lm_b or has_res_b:
+                zero_b = torch.zeros((h_dit,), device=device, dtype=dtype)
+                dit_proj_b = torch.stack(
+                    (
+                        m.lm_to_dit_proj.bias if has_lm_b else zero_b,
+                        m.res_to_dit_proj.bias if has_res_b else zero_b,
+                    ),
+                    dim=0,
+                ).unsqueeze(1).contiguous()
+            else:
+                dit_proj_b = None
+        else:
+            dit_proj_w = None
+            dit_proj_b = None
+        mu_in = torch.zeros((2, h_dit * 2), device=device, dtype=dtype)
+        mu_pos_view = mu_in[0].view(2, 1, h_dit)
         dt_zeros = torch.zeros((2,), device=device, dtype=dtype)
         schedule_steps: list[tuple[torch.Tensor, torch.Tensor, bool]] = []
         t_cur = t_span[0]
@@ -588,11 +623,17 @@ class _MegaStepRunner:
                 dt_cur = t_cur - t_span[s_idx + 1]
 
         def step_fn():
-            dit_h = torch.cat((m.lm_to_dit_proj(lm_hidden), m.res_to_dit_proj(res_hidden)), dim=-1)
+            if fuse_dit_proj:
+                if dit_proj_b is not None:
+                    torch.baddbmm(dit_proj_b, lm_res_hidden, dit_proj_w, out=mu_pos_view)
+                else:
+                    torch.bmm(lm_res_hidden, dit_proj_w, out=mu_pos_view)
+            else:
+                dit_h = torch.cat((m.lm_to_dit_proj(lm_hidden), m.res_to_dit_proj(res_hidden)), dim=-1)
+                mu_in[0:1].copy_(dit_h)
             cond_t = prefix_cond.transpose(1, 2).contiguous()
             x = noise_z
             cond_in = torch.cat((cond_t, cond_t), dim=0)
-            mu_in = torch.cat((dit_h, mu_zeros), dim=0)
 
             for t_val, dt_val, is_zero in schedule_steps:
                 if not is_zero:
@@ -655,7 +696,16 @@ class _MegaStepRunner:
             "out_latent": out_latent_fp32,
             "out_stop": out_stop,
             # Keep every captured constant buffer alive so PyTorch's caching allocator never reuses them!
-            "_keepalive": (mu_zeros, dt_zeros, schedule_steps, t_span),
+            "_keepalive": (
+                lm_res_hidden,
+                dit_proj_w,
+                dit_proj_b,
+                mu_in,
+                mu_pos_view,
+                dt_zeros,
+                schedule_steps,
+                t_span,
+            ),
         }
         self._graphs[key] = entry
         return entry
@@ -816,60 +866,7 @@ class _MegaStepRunner:
         else:
             text = target_text
 
-        text_token = torch.LongTensor(m.text_tokenizer(text))
-        text_token = torch.cat(
-            [text_token, torch.tensor([m.audio_start_token], dtype=torch.int32)], dim=-1
-        )
-        text_length = text_token.shape[0]
-
-        if mode in ("zero_shot", "continuation"):
-            prompt_audio_feat = (
-                prompt_cache["audio_feat"]
-                if prompt_cache
-                else torch.empty((0, m.patch_size, m.audio_vae.latent_dim), dtype=torch.float32)
-            )
-            audio_length = prompt_audio_feat.size(0)
-            text_token = torch.cat([text_token, torch.zeros(audio_length, dtype=torch.int32)])
-            audio_feat = torch.cat(
-                [
-                    torch.zeros((text_length, m.patch_size, m.audio_vae.latent_dim), dtype=torch.float32),
-                    prompt_audio_feat,
-                ],
-                dim=0,
-            )
-            text_mask = torch.cat([torch.ones(text_length, dtype=torch.int32), torch.zeros(audio_length, dtype=torch.int32)])
-            audio_mask = torch.cat([torch.zeros(text_length, dtype=torch.int32), torch.ones(audio_length, dtype=torch.int32)])
-        elif mode == "reference":
-            ref_tokens, ref_feats, ref_t_mask, ref_a_mask = m._make_ref_prefix(prompt_cache["ref_audio_feat"], text_token.device)
-            text_token = torch.cat([ref_tokens, text_token])
-            audio_feat = torch.cat(
-                [ref_feats, torch.zeros((text_length, m.patch_size, m.audio_vae.latent_dim), dtype=torch.float32)],
-                dim=0,
-            )
-            text_mask = torch.cat([ref_t_mask, torch.ones(text_length, dtype=torch.int32)])
-            audio_mask = torch.cat([ref_a_mask, torch.zeros(text_length, dtype=torch.int32)])
-        else:
-            ref_audio_feat = prompt_cache["ref_audio_feat"]
-            prompt_audio_feat = prompt_cache["audio_feat"]
-            prompt_audio_length = prompt_audio_feat.size(0)
-            ref_tokens, ref_feats, ref_t_mask, ref_a_mask = m._make_ref_prefix(ref_audio_feat, text_token.device)
-            text_token = torch.cat([ref_tokens, text_token, torch.zeros(prompt_audio_length, dtype=torch.int32)])
-            audio_feat = torch.cat(
-                [
-                    ref_feats,
-                    torch.zeros((text_length, m.patch_size, m.audio_vae.latent_dim), dtype=torch.float32),
-                    prompt_audio_feat,
-                ],
-                dim=0,
-            )
-            text_mask = torch.cat([ref_t_mask, torch.ones(text_length, dtype=torch.int32), torch.zeros(prompt_audio_length, dtype=torch.int32)])
-            audio_mask = torch.cat([ref_a_mask, torch.zeros(text_length, dtype=torch.int32), torch.ones(prompt_audio_length, dtype=torch.int32)])
-
-        text_token = text_token.unsqueeze(0).to(device)
-        text_mask = text_mask.unsqueeze(0).to(device)
-        audio_feat = audio_feat.unsqueeze(0).to(device=device, dtype=dtype)
-        audio_mask = audio_mask.unsqueeze(0).to(device)
-
+        full_text_tokens = torch.LongTensor(m.text_tokenizer(text))
         target_text_length = len(m.text_tokenizer(target_text))
         eff_max_len = min(int(target_text_length * retry_badcase_ratio_threshold + 10), max_len)
 
@@ -880,12 +877,12 @@ class _MegaStepRunner:
         # Capture/fetch Mega-Step CUDA graph BEFORE fill_caches so warmup never overwrites live KV!
         g = self._get_or_capture_graph(inference_timesteps, cfg_value)
 
-        # Fast incremental prefill path for ref_continuation (bit-identical causal KV prefix reuse)
+        # Fast incremental prefill path for ref_continuation (bit-identical causal KV prefix reuse;
+        # skips building unused full CPU/GPU prompt tensors when the static prefix snapshot hits)
         used_prefix_cache = False
         if mode == "ref_continuation" and prompt_cache:
             snap = self._get_or_build_ref_continuation_prefix(prompt_cache)
             n_stable = snap["n_stable_text"] if snap else 0
-            full_text_tokens = torch.LongTensor(m.text_tokenizer(text))
             if (
                 snap is not None
                 and full_text_tokens.shape[0] >= n_stable
@@ -894,45 +891,35 @@ class _MegaStepRunner:
                 rem_text_tokens = torch.cat(
                     [
                         full_text_tokens[n_stable:],
-                        torch.tensor([m.audio_start_token], dtype=torch.int32),
+                        torch.tensor([m.audio_start_token], dtype=torch.long),
                     ],
                     dim=-1,
                 )
                 n_rem_text = int(rem_text_tokens.shape[0])
                 prompt_audio_embed = snap["prompt_audio_embed"]
-                n_prompt_audio = int(prompt_audio_embed.shape[1])
 
                 scale_emb = m.config.lm_config.scale_emb if getattr(m.config.lm_config, "use_mup", False) else 1.0
-                rem_tokens_gpu = torch.cat(
-                    [rem_text_tokens, torch.zeros(n_prompt_audio, dtype=torch.int32)]
-                ).unsqueeze(0).to(device)
-                rem_t_mask = torch.cat(
-                    [torch.ones(n_rem_text, dtype=torch.int32), torch.zeros(n_prompt_audio, dtype=torch.int32)]
-                ).unsqueeze(0).to(device)
-                rem_a_mask = torch.cat(
-                    [torch.zeros(n_rem_text, dtype=torch.int32), torch.ones(n_prompt_audio, dtype=torch.int32)]
-                ).unsqueeze(0).to(device)
-
-                rem_text_embed = m.base_lm.embed_tokens(rem_tokens_gpu) * scale_emb
-                zeros_rem_feat = torch.zeros(
-                    (1, n_rem_text, prompt_audio_embed.shape[-1]), device=device, dtype=dtype
-                )
-                rem_feat_embed = torch.cat((zeros_rem_feat, prompt_audio_embed), dim=1)
-                suffix_combined = (
-                    rem_t_mask.unsqueeze(-1) * rem_text_embed
-                    + rem_a_mask.unsqueeze(-1) * rem_feat_embed
-                )
+                rem_text_embed = m.base_lm.embed_tokens(rem_text_tokens.unsqueeze(0).to(device))
+                if scale_emb != 1.0:
+                    rem_text_embed = rem_text_embed * scale_emb
+                suffix_combined = torch.cat((rem_text_embed, prompt_audio_embed), dim=1)
 
                 enc_suf, kv_cache_tuple = self._forward_lm_with_prefix(
                     m.base_lm, suffix_combined, snap["base_pre_kv"], snap["prefix_len"]
                 )
                 m.base_lm.kv_cache.fill_caches(kv_cache_tuple)
-                enc_suf = m.fsq_layer(enc_suf) * rem_a_mask.unsqueeze(-1) + enc_suf * rem_t_mask.unsqueeze(-1)
+                if prompt_audio_embed.shape[1] > 0:
+                    enc_suf = torch.cat(
+                        (enc_suf[:, :n_rem_text, :], m.fsq_layer(enc_suf[:, n_rem_text:, :])),
+                        dim=1,
+                    )
                 init_lm = enc_suf[:, -1, :]
 
-                res_suf_in = m.fusion_concat_proj(
-                    torch.cat((enc_suf, rem_a_mask.unsqueeze(-1) * rem_feat_embed), dim=-1)
+                zeros_rem_feat = torch.zeros(
+                    (1, n_rem_text, prompt_audio_embed.shape[-1]), device=device, dtype=dtype
                 )
+                rem_feat_embed = torch.cat((zeros_rem_feat, prompt_audio_embed), dim=1)
+                res_suf_in = m.fusion_concat_proj(torch.cat((enc_suf, rem_feat_embed), dim=-1))
                 res_suf_out, res_kv = self._forward_lm_with_prefix(
                     m.residual_lm, res_suf_in, snap["res_pre_kv"], snap["prefix_len"]
                 )
@@ -942,7 +929,70 @@ class _MegaStepRunner:
                 used_prefix_cache = True
 
         if not used_prefix_cache:
-            # Standard full prefill fallback
+            # Standard full prefill fallback (only build full CPU/GPU tensors when prefix cache misses)
+            text_token = torch.cat(
+                [full_text_tokens, torch.tensor([m.audio_start_token], dtype=torch.int32)], dim=-1
+            )
+            text_length = text_token.shape[0]
+
+            if mode in ("zero_shot", "continuation"):
+                prompt_audio_feat = (
+                    prompt_cache["audio_feat"]
+                    if prompt_cache
+                    else torch.empty((0, m.patch_size, m.audio_vae.latent_dim), dtype=torch.float32)
+                )
+                audio_length = prompt_audio_feat.size(0)
+                text_token = torch.cat([text_token, torch.zeros(audio_length, dtype=torch.int32)])
+                audio_feat = torch.cat(
+                    [
+                        torch.zeros((text_length, m.patch_size, m.audio_vae.latent_dim), dtype=torch.float32),
+                        prompt_audio_feat,
+                    ],
+                    dim=0,
+                )
+                text_mask = torch.cat(
+                    [torch.ones(text_length, dtype=torch.int32), torch.zeros(audio_length, dtype=torch.int32)]
+                )
+                audio_mask = torch.cat(
+                    [torch.zeros(text_length, dtype=torch.int32), torch.ones(audio_length, dtype=torch.int32)]
+                )
+            elif mode == "reference":
+                ref_tokens, ref_feats, ref_t_mask, ref_a_mask = m._make_ref_prefix(
+                    prompt_cache["ref_audio_feat"], text_token.device
+                )
+                text_token = torch.cat([ref_tokens, text_token])
+                audio_feat = torch.cat(
+                    [ref_feats, torch.zeros((text_length, m.patch_size, m.audio_vae.latent_dim), dtype=torch.float32)],
+                    dim=0,
+                )
+                text_mask = torch.cat([ref_t_mask, torch.ones(text_length, dtype=torch.int32)])
+                audio_mask = torch.cat([ref_a_mask, torch.zeros(text_length, dtype=torch.int32)])
+            else:
+                ref_audio_feat = prompt_cache["ref_audio_feat"]
+                prompt_audio_feat = prompt_cache["audio_feat"]
+                prompt_audio_length = prompt_audio_feat.size(0)
+                ref_tokens, ref_feats, ref_t_mask, ref_a_mask = m._make_ref_prefix(ref_audio_feat, text_token.device)
+                text_token = torch.cat([ref_tokens, text_token, torch.zeros(prompt_audio_length, dtype=torch.int32)])
+                audio_feat = torch.cat(
+                    [
+                        ref_feats,
+                        torch.zeros((text_length, m.patch_size, m.audio_vae.latent_dim), dtype=torch.float32),
+                        prompt_audio_feat,
+                    ],
+                    dim=0,
+                )
+                text_mask = torch.cat(
+                    [ref_t_mask, torch.ones(text_length, dtype=torch.int32), torch.zeros(prompt_audio_length, dtype=torch.int32)]
+                )
+                audio_mask = torch.cat(
+                    [ref_a_mask, torch.zeros(text_length, dtype=torch.int32), torch.ones(prompt_audio_length, dtype=torch.int32)]
+                )
+
+            text_token = text_token.unsqueeze(0).to(device)
+            text_mask = text_mask.unsqueeze(0).to(device)
+            audio_feat = audio_feat.unsqueeze(0).to(device=device, dtype=dtype)
+            audio_mask = audio_mask.unsqueeze(0).to(device)
+
             prefill_enc = getattr(m, "_feat_encoder_raw", m.feat_encoder)
             feat_embed = m.enc_to_lm_proj(prefill_enc(audio_feat))
             scale_emb = m.config.lm_config.scale_emb if getattr(m.config.lm_config, "use_mup", False) else 1.0
@@ -975,18 +1025,14 @@ class _MegaStepRunner:
 
         # Pre-sample all diffusion noise for this sentence in 1 kernel call (reproducible with seed!)
         all_noise = torch.randn((eff_max_len, 1, m.feat_dim, m.patch_size), device=device, dtype=dtype)
-        latent_staging = [
-            torch.empty((1, m.feat_dim, m.patch_size), device=device, dtype=torch.float32),
-            torch.empty((1, m.feat_dim, m.patch_size), device=device, dtype=torch.float32),
-        ]
-        stop_staging = [
-            torch.empty((), dtype=torch.int64, pin_memory=True),
-            torch.empty((), dtype=torch.int64, pin_memory=True),
-        ]
+        latent_staging = self._latent_staging
+        stop_staging = self._stop_staging
+        latent_ready_events = self._latent_ready_events
+        vae_done_events = self._vae_done_events
 
         main_stream = torch.cuda.current_stream()
         vae_stream = self._vae_stream
-        vae_done_events: list[torch.cuda.Event | None] = [None, None]
+        vae_slot_active = [False, False]
         pending_slot: int | None = None
         pending_step: int = -1
 
@@ -997,8 +1043,9 @@ class _MegaStepRunner:
 
                 slot = i & 1
                 # Ensure previous use of this slot's staging buffer finished before overwriting
-                if vae_done_events[slot] is not None:
+                if vae_slot_active[slot]:
                     vae_done_events[slot].synchronize()
+                    vae_slot_active[slot] = False
                     if pending_slot == slot:
                         yield self._pinned_bufs[slot].numpy().copy()
                         pending_slot = None
@@ -1009,26 +1056,26 @@ class _MegaStepRunner:
                 latent_staging[slot].copy_(g["out_latent"])
                 stop_staging[slot].copy_(g["out_stop"], non_blocking=True)
 
-                latent_ready = torch.cuda.Event()
-                latent_ready.record(main_stream)
+                latent_ready_events[slot].record(main_stream)
 
                 # Launch AudioVAE FP32 CUDA Graph + non-blocking D2H copy on vae_stream!
                 with torch.cuda.stream(vae_stream):
-                    vae_stream.wait_event(latent_ready)
+                    vae_stream.wait_event(latent_ready_events[slot])
                     wav_gpu = self._vae_graph.decode_chunk(latent_staging[slot])
                     self._pinned_bufs[slot].copy_(wav_gpu.reshape(-1), non_blocking=True)
-                    done_ev = torch.cuda.Event()
-                    done_ev.record(vae_stream)
-                    vae_done_events[slot] = done_ev
+                    vae_done_events[slot].record(vae_stream)
+                    vae_slot_active[slot] = True
 
                 # Yield the PREVIOUS step's audio while current step's VAE decodes in parallel!
                 prev_slot = 1 - slot
-                if pending_slot == prev_slot and vae_done_events[prev_slot] is not None:
+                if pending_slot == prev_slot and vae_slot_active[prev_slot]:
                     vae_done_events[prev_slot].synchronize()
+                    vae_slot_active[prev_slot] = False
                     yield self._pinned_bufs[prev_slot].numpy().copy()
                     # Check previous step's stop flag (already ready with zero extra stall!)
                     if pending_step > min_len and int(stop_staging[prev_slot].item()) == 1:
                         vae_done_events[slot].synchronize()
+                        vae_slot_active[slot] = False
                         pending_slot = None
                         break
                     pending_slot = None
@@ -1039,14 +1086,15 @@ class _MegaStepRunner:
                 # Check stop flag immediately if this is the last allowed step
                 if i == eff_max_len - 1:
                     vae_done_events[slot].synchronize()
+                    vae_slot_active[slot] = False
                     yield self._pinned_bufs[slot].numpy().copy()
                     pending_slot = None
 
             # Flush final buffered chunk if loop exited without hitting max_len or stop_event
             if pending_slot is not None:
-                ev = vae_done_events[pending_slot]
-                if ev is not None:
-                    ev.synchronize()
+                if vae_slot_active[pending_slot]:
+                    vae_done_events[pending_slot].synchronize()
+                    vae_slot_active[pending_slot] = False
                 if stop_event is None or not stop_event.is_set():
                     yield self._pinned_bufs[pending_slot].numpy().copy()
         finally:
