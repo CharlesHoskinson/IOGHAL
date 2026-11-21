@@ -139,6 +139,27 @@ try:
         else:
             tl.store(part_ptr + pid_k * N + offs_n, acc, mask=mask_n)
 
+    @triton.jit
+    def _snake1d_fp32_kernel(
+        x_ptr,
+        alpha_ptr,
+        inv_alpha_ptr,
+        y_ptr,
+        T,
+        BLOCK_T: tl.constexpr,
+    ):
+        pid_t = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        mask = t_offs < T
+        row_off = pid_c * T + t_offs
+        x = tl.load(x_ptr + row_off, mask=mask, other=0.0).to(tl.float32)
+        a = tl.load(alpha_ptr + pid_c).to(tl.float32)
+        inv_a = tl.load(inv_alpha_ptr + pid_c).to(tl.float32)
+        s = tl.sin(a * x)
+        y = x + inv_a * (s * s)
+        tl.store(y_ptr + row_off, y, mask=mask)
+
     TRITON_AVAILABLE = True
 except (ImportError, RuntimeError, OSError):
     TRITON_AVAILABLE = False
@@ -367,6 +388,29 @@ class Int4Linear(nn.Module):
                 y = y + self.bias
             return y.view(*orig_shape[:-1], self.out_features)
         return F.linear(x2d, self._dequant(), self.bias).view(*orig_shape[:-1], self.out_features)
+
+
+def snake1d_fp32(x: torch.Tensor, alpha_1d: torch.Tensor, inv_alpha_1d: torch.Tensor) -> torch.Tensor:
+    """Exact lossless FP32 Snake1d activation: x + (alpha + 1e-9)^-1 * sin(alpha * x)^2."""
+    if TRITON_AVAILABLE and x.is_cuda and x.ndim == 3 and x.shape[0] == 1 and x.dtype == torch.float32:
+        x_c = x.contiguous()
+        _, c_dim, t_dim = x_c.shape
+        y = torch.empty_like(x_c)
+        block_t = min(1024, max(16, triton.next_power_of_2(t_dim)))
+        grid = (triton.cdiv(t_dim, block_t), c_dim)
+        _snake1d_fp32_kernel[grid](
+            x_c,
+            alpha_1d,
+            inv_alpha_1d,
+            y,
+            t_dim,
+            BLOCK_T=block_t,
+            num_warps=4 if block_t >= 256 else 2,
+        )
+        return y
+    a = alpha_1d.view(1, -1, 1)
+    inv_a = inv_alpha_1d.view(1, -1, 1)
+    return x + inv_a * torch.sin(a * x).pow(2)
 
 
 def probe_fp8_supported(device: str | torch.device) -> bool:

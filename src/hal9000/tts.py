@@ -397,6 +397,7 @@ class _FastAudioVAEGraph:
         self.device = next(audio_vae.decoder.parameters()).device
         self.dtype = next(audio_vae.decoder.parameters()).dtype
         self._state_bufs: list[torch.Tensor] = []
+        self._keepalive: list[torch.Tensor] = []
         self._originals: list[tuple[nn.Module, object]] = []
         self._sr_cond = torch.tensor([audio_vae.out_sample_rate], device=self.device, dtype=torch.int32)
         self._static_z = torch.zeros((1, audio_vae.latent_dim, patch_size), device=self.device, dtype=self.dtype)
@@ -409,6 +410,16 @@ class _FastAudioVAEGraph:
         from voxcpm.modules.audiovae.audio_vae_v2 import (
             CausalConv1d,
             CausalTransposeConv1d,
+            SampleRateConditionLayer,
+            Snake1d,
+        )
+
+        from ._cuda_ops import snake1d_fp32
+
+        sr_idx = (
+            self.vae.decoder.get_sr_idx(self._sr_cond)
+            if getattr(self.vae.decoder, "sr_bin_boundaries", None) is not None
+            else None
         )
 
         for mod in self.vae.decoder.modules():
@@ -450,6 +461,38 @@ class _FastAudioVAEGraph:
 
                     mod.forward = _make_tconv(mod, buf, ctx, trim)
                     self._originals.append((mod, orig))
+            elif isinstance(mod, Snake1d) and TRITON_AVAILABLE and self.dtype == torch.float32:
+                orig = mod.forward
+                alpha_1d = mod.alpha.detach().reshape(-1).to(device=self.device, dtype=torch.float32).contiguous()
+                inv_alpha_1d = (alpha_1d + 1e-9).reciprocal().contiguous()
+                self._keepalive.extend((alpha_1d, inv_alpha_1d))
+
+                def _make_snake(_a, _ia):
+                    def fwd(x):
+                        return snake1d_fp32(x, _a, _ia)
+                    return fwd
+
+                mod.forward = _make_snake(alpha_1d, inv_alpha_1d)
+                self._originals.append((mod, orig))
+            elif (
+                isinstance(mod, SampleRateConditionLayer)
+                and sr_idx is not None
+                and mod.cond_type in ("scale_bias", "scale_bias_init")
+                and isinstance(mod.out_layer, nn.Identity)
+            ):
+                orig = mod.forward
+                with torch.no_grad():
+                    scale = mod.scale_embed(sr_idx).unsqueeze(-1).contiguous()
+                    bias = mod.bias_embed(sr_idx).unsqueeze(-1).contiguous()
+                self._keepalive.extend((scale, bias))
+
+                def _make_sr_cond(_s, _b):
+                    def fwd(x, _sr_cond=None):
+                        return x * _s + _b
+                    return fwd
+
+                mod.forward = _make_sr_cond(scale, bias)
+                self._originals.append((mod, orig))
 
         with CUDA_GRAPH_LOCK:
             torch.cuda.synchronize()
