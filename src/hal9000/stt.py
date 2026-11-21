@@ -297,6 +297,123 @@ try:
             dst = v_cache_ptr + vh * stride_vc_h + pos * stride_vc_t
             tl.store(dst + offs, v_val, mask=mask)
 
+    @triton.jit
+    def _whisper_cross_attn_splitkv_stage1_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        part_acc_ptr,
+        part_m_ptr,
+        part_l_ptr,
+        src_len,
+        stride_kh,
+        stride_kt,
+        stride_vh,
+        stride_vt,
+        stride_ah,
+        stride_as,
+        HEAD_DIM: tl.constexpr,
+        HEAD_BLOCK: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+        NUM_SPLITS: tl.constexpr,
+    ):
+        pid_h = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        offs_d = tl.arange(0, HEAD_BLOCK)
+        mask_d = offs_d < HEAD_DIM
+        offs_t = tl.arange(0, BLOCK_T)
+
+        q = tl.load(q_ptr + pid_h * HEAD_DIM + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+        k_head_ptr = k_ptr + pid_h * stride_kh
+        v_head_ptr = v_ptr + pid_h * stride_vh
+
+        split_size = tl.cdiv(src_len, NUM_SPLITS)
+        t_start = pid_s * split_size
+        t_end = tl.minimum(t_start + split_size, src_len)
+
+        m_i = -1.0e38
+        l_i = 0.0
+        acc = tl.zeros((HEAD_BLOCK,), dtype=tl.float32)
+
+        for t0 in range(t_start, t_end, BLOCK_T):
+            t_idx = t0 + offs_t
+            mask_t = t_idx < t_end
+            mask_td = mask_t[:, None] & mask_d[None, :]
+            t_i64 = t_idx.to(tl.int64)
+            k_tile = tl.load(
+                k_head_ptr + t_i64[:, None] * stride_kt + offs_d[None, :],
+                mask=mask_td,
+                other=0.0,
+            ).to(tl.float32)
+            v_tile = tl.load(
+                v_head_ptr + t_i64[:, None] * stride_vt + offs_d[None, :],
+                mask=mask_td,
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.sum(k_tile * q[None, :], axis=1)
+            scores = tl.where(mask_t, scores, -1.0e38)
+            block_max = tl.max(scores, axis=0)
+            m_new = tl.maximum(m_i, block_max)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.where(mask_t, tl.exp(scores - m_new), 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=0)
+            acc = acc * alpha + tl.sum(p[:, None] * v_tile, axis=0)
+            m_i = m_new
+
+        ms_off = pid_h * NUM_SPLITS + pid_s
+        tl.store(part_m_ptr + ms_off, m_i)
+        tl.store(part_l_ptr + ms_off, l_i)
+        tl.store(
+            part_acc_ptr + pid_h * stride_ah + pid_s * stride_as + offs_d,
+            acc,
+            mask=mask_d,
+        )
+
+    @triton.jit
+    def _whisper_cross_attn_splitkv_stage2_fp8_kernel(
+        part_acc_ptr,
+        part_m_ptr,
+        part_l_ptr,
+        y_fp8_ptr,
+        s_out_ptr,
+        embed_dim,
+        stride_ah,
+        stride_as,
+        HEAD_DIM: tl.constexpr,
+        NUM_SPLITS: tl.constexpr,
+        BLOCK_COLS: tl.constexpr,
+    ):
+        cols = tl.arange(0, BLOCK_COLS)
+        mask_c = cols < embed_dim
+        head = cols // HEAD_DIM
+        dim = cols % HEAD_DIM
+
+        m_max = tl.full((BLOCK_COLS,), -1.0e38, dtype=tl.float32)
+        for s in tl.static_range(0, NUM_SPLITS):
+            m_s = tl.load(part_m_ptr + head * NUM_SPLITS + s, mask=mask_c, other=-1.0e38)
+            m_max = tl.maximum(m_max, m_s)
+
+        l_sum = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+        acc_sum = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+        for s in tl.static_range(0, NUM_SPLITS):
+            m_s = tl.load(part_m_ptr + head * NUM_SPLITS + s, mask=mask_c, other=-1.0e38)
+            l_s = tl.load(part_l_ptr + head * NUM_SPLITS + s, mask=mask_c, other=0.0)
+            a_s = tl.load(
+                part_acc_ptr + head * stride_ah + s * stride_as + dim,
+                mask=mask_c,
+                other=0.0,
+            )
+            w_s = tl.exp(m_s - m_max)
+            l_sum += l_s * w_s
+            acc_sum += a_s * w_s
+
+        y = tl.where(mask_c, acc_sum / tl.maximum(l_sum, 1e-12), 0.0)
+        amax = tl.max(tl.abs(y), axis=0)
+        scale = tl.maximum(amax, 1e-12) / 448.0
+        tl.store(s_out_ptr, scale)
+        q = tl.clamp(y / scale, -448.0, 448.0).to(tl.float8e4nv)
+        tl.store(y_fp8_ptr + cols, q, mask=mask_c)
+
     _STT_TRITON_AVAILABLE = True
 except (ImportError, RuntimeError, OSError):
     _STT_TRITON_AVAILABLE = False
@@ -642,6 +759,75 @@ def _whisper_qkv_scatter_step(
     k_cache.index_copy_(2, pos_id, k)
     v_cache.index_copy_(2, pos_id, v)
     return q
+
+
+def _whisper_cross_attn_step_fp8_linear(
+    cq: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out_proj: FP8Linear,
+    part_acc: torch.Tensor,
+    part_m: torch.Tensor,
+    part_l: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """2-stage Split-KV Flash-Decoding cross-attention fused with rowwise FP8 quant -> out_proj."""
+    embed_dim = num_heads * head_dim
+    num_splits = int(part_m.shape[1])
+    if (
+        _STT_TRITON_AVAILABLE
+        and cq.is_cuda
+        and k_cache.stride(-1) == 1
+        and v_cache.stride(-1) == 1
+    ):
+        block_cols = triton.next_power_of_2(embed_dim)
+        if block_cols <= 8192:
+            q_flat = cq.reshape(-1).contiguous()
+            src_len = int(k_cache.shape[2])
+            head_block = triton.next_power_of_2(head_dim)
+            _whisper_cross_attn_splitkv_stage1_kernel[(num_heads, num_splits)](
+                q_flat,
+                k_cache,
+                v_cache,
+                part_acc,
+                part_m,
+                part_l,
+                src_len,
+                k_cache.stride(1),
+                k_cache.stride(2),
+                v_cache.stride(1),
+                v_cache.stride(2),
+                part_acc.stride(0),
+                part_acc.stride(1),
+                HEAD_DIM=head_dim,
+                HEAD_BLOCK=head_block,
+                BLOCK_T=64,
+                NUM_SPLITS=num_splits,
+                num_warps=4,
+            )
+            y_fp8 = torch.empty((1, embed_dim), device=cq.device, dtype=torch.float8_e4m3fn)
+            s_out = torch.empty((1, 1), device=cq.device, dtype=torch.float32)
+            _whisper_cross_attn_splitkv_stage2_fp8_kernel[(1,)](
+                part_acc,
+                part_m,
+                part_l,
+                y_fp8,
+                s_out,
+                embed_dim,
+                part_acc.stride(0),
+                part_acc.stride(1),
+                HEAD_DIM=head_dim,
+                NUM_SPLITS=num_splits,
+                BLOCK_COLS=block_cols,
+                num_warps=4 if block_cols <= 2048 else 8,
+            )
+            return _fp8_mm_prequant(y_fp8, s_out, out_proj, cq.shape)
+    cq4 = cq.view(1, 1, num_heads, head_dim).transpose(1, 2)
+    cross_out = F.scaled_dot_product_attention(
+        cq4, k_cache, v_cache, dropout_p=0.0, is_causal=False, scale=1.0
+    )
+    return out_proj(cross_out.transpose(1, 2).reshape(1, 1, embed_dim))
 
 
 def _has_speech_activity(audio: np.ndarray, sample_rate: int = 16000) -> bool:
@@ -1145,6 +1331,19 @@ class _FastWhisperDecoder:
         self._cur_token = torch.zeros((1, 1), device=device, dtype=torch.long)
         self._pos_id = torch.zeros((1,), device=device, dtype=torch.long)
         self._host_token = torch.empty((1, 1), dtype=torch.long, pin_memory=torch.cuda.is_available())
+        # Pre-allocated L2-resident scratch for Split-KV cross-attention decoding (8 splits x 20 heads = 160 CTAs)
+        self._cross_num_splits = 8
+        self._cross_part_acc = torch.empty(
+            (self.num_heads, self._cross_num_splits, self.head_dim),
+            device=device,
+            dtype=torch.float32,
+        )
+        self._cross_part_m = torch.empty(
+            (self.num_heads, self._cross_num_splits), device=device, dtype=torch.float32
+        )
+        self._cross_part_l = torch.empty(
+            (self.num_heads, self._cross_num_splits), device=device, dtype=torch.float32
+        )
 
         self._enc_prefill_graph: torch.cuda.CUDAGraph | None = None
         self._prefill_graph: torch.cuda.CUDAGraph | None = None
@@ -1419,17 +1618,16 @@ class _FastWhisperDecoder:
                     h, self_proj, layer.encoder_attn_layer_norm
                 )
                 cq = _fp8_mm_prequant(cross_fp8, cross_scale, layer.encoder_attn.q_proj, orig_shape)
-                cq = cq.view(1, 1, self.num_heads, self.head_dim).transpose(1, 2)
-                cross_out = F.scaled_dot_product_attention(
+                cross_proj = _whisper_cross_attn_step_fp8_linear(
                     cq,
                     self._cross_k[idx],
                     self._cross_v[idx],
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=1.0,
-                )
-                cross_proj = layer.encoder_attn.out_proj(
-                    cross_out.transpose(1, 2).reshape(1, 1, self.embed_dim)
+                    layer.encoder_attn.out_proj,
+                    self._cross_part_acc,
+                    self._cross_part_m,
+                    self._cross_part_l,
+                    self.num_heads,
+                    self.head_dim,
                 )
 
                 h, ffn_fp8, ffn_scale = _residual_add_layernorm_fp8_quant(
