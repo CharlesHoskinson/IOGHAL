@@ -384,6 +384,80 @@ module ioghal_protocol_test {
       .expect(clients.get(1).uiState == UiIdle)
       .expect(allInvariants)
 
+  // 19. Browser streaming mic (`audio_stream_start -> chunks -> audio_stream_end`) completes
+  //     concurrently while Tab 2 holds the physical PipeWire mic (`hw.micOwner == 2`), zero contention!
+  run browserStreamingMicTurnWithoutMicOwnerContentionTest =
+    init
+      .then(clientBeginPtt(2, SpaceOwner))
+      .then(serverProcessC2S(2))
+      .expect(hw.micOwner == 2)
+      .then(clientToggleMicMode(1))
+      .then(clientBeginPtt(1, SpaceOwner))
+      .then(serverProcessC2S(1)) // silent interrupt
+      .then(clientBrowserStreamStart(1, true))
+      .then(serverProcessC2S(1)) // MsgAudioStreamStart(cid=1)
+      .expect(servers.get(1).streamCaptureActive)
+      .expect(hw.micOwner == 2)
+      .then(clientBrowserStreamChunk(1, 1, true))
+      .then(serverProcessC2S(1))
+      .then(clientFinishBrowserStream(1))
+      .then(serverProcessC2S(1)) // MsgAudioStreamEnd -> WorkerStt directly!
+      .expect(not(servers.get(1).streamCaptureActive))
+      .expect(servers.get(1).workerStage == WorkerStt)
+      .expect(hw.micOwner == 2)
+      .then(workerSttAcquireGpu(1))
+      .then(workerSttComplete(1, true))
+      .then(clientReceiveS2C(1))
+      .then(workerSearchComplete(1, false, false))
+      .then(workerLlmProduceSentence(1))
+      .then(workerLlmFinish(1))
+      .then(workerTtsPopAndAcquireGpu(1))
+      .then(workerTtsEmitChunk(1))
+      .then(workerTtsFinishSentence(1))
+      .then(workerPipelineFinish(1))
+      .then(clientReceiveS2C(1))
+      .then(clientReceiveS2C(1))
+      .then(clientReceiveS2C(1))
+      .then(clientPlaybackDrain(1))
+      .expect(cov.browserStreamTurn)
+      .expect(clients.get(1).uiState == UiIdle)
+      .expect(allInvariants)
+
+  // 20. Rapid double `audio_stream_start` + Escape cancel discards buffer and ignores stale chunks.
+  run browserStreamingMicRapidDoubleAndCancelTest =
+    init
+      .then(clientToggleMicMode(1))
+      .then(clientBeginPtt(1, SpaceOwner))
+      .then(serverProcessC2S(1))
+      .then(clientBrowserStreamStart(1, true))
+      .then(serverProcessC2S(1))
+      .then(clientBrowserStreamStart(1, true)) // rapid double start replaces capture cleanly
+      .then(serverProcessC2S(1))
+      .expect(cov.browserStreamRapidDouble)
+      .then(clientCancelEscape(1))
+      .then(serverProcessC2S(1)) // MsgInterrupt clears streamCaptureActive
+      .expect(not(servers.get(1).streamCaptureActive))
+      .expect(cov.browserStreamBargeIn)
+      .then(clientReceiveS2C(1)) // EvState(UiIdle)
+      .expect(clients.get(1).uiState == UiIdle)
+      .expect(allInvariants)
+
+  // 21. Abrupt WebSocket disconnect mid-stream clears `streamCaptureActive` cleanly and allows reconnect.
+  run browserStreamingMicDisconnectCleanupTest =
+    init
+      .then(clientToggleMicMode(1))
+      .then(clientBeginPtt(1, SpaceOwner))
+      .then(serverProcessC2S(1))
+      .then(clientBrowserStreamStart(1, true))
+      .then(serverProcessC2S(1))
+      .expect(servers.get(1).streamCaptureActive)
+      .then(clientDisconnect(1))
+      .expect(not(servers.get(1).streamCaptureActive))
+      .expect(invNoOrphanedStreamCapture)
+      .then(clientReconnect(1))
+      .expect(clients.get(1).connected)
+      .expect(allInvariants)
+
   // Connected-session step omitting random disconnects so multi-turn replay & LLM/TTS overlap
   // are deeply stress-tested across thousands of random traces.
   action stepConnected: bool = {
@@ -393,6 +467,11 @@ module ioghal_protocol_test {
       runtimeWarmupRelease,
       retiredWorkerReleaseGpu,
       clientBeginPtt(id, SpaceOwner),
+      clientBrowserStreamStart(id, true),
+      clientBrowserStreamStart(id, false),
+      clientBrowserStreamChunk(id, clients.get(id).activeCaptureId, true),
+      clientBrowserStreamChunk(id, clients.get(id).activeCaptureId, false),
+      clientFinishBrowserStream(id),
       clientRapidDoublePtt(id),
       clientTapLatch(id),
       clientFinishPtt(id, true),

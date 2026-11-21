@@ -1477,5 +1477,188 @@ class TestPipelineAndServer(unittest.TestCase):
 
 
 
+    def test_streaming_browser_mic_resamples_live_and_ignores_stale_capture_frames(self) -> None:
+        """Live binary browser mic streaming resamples 48->16 kHz incrementally and ignores stale cids."""
+        captured: list[tuple[np.ndarray, int]] = []
+
+        class _CaptureSTT:
+            def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
+                captured.append((audio.copy(), sample_rate))
+                return "Open the pod bay doors"
+
+        runtime = HalRuntime(
+            HalConfig(model="mock", steps=6),
+            stt=_CaptureSTT(),
+            tts=_FakeTTS(),
+            brain_factory=lambda rt: QwenBrain(model="mock", enable_web_search=False),
+        )
+        router = create_hal_router(runtime)
+        ws_route = next(r for r in router.routes if getattr(r, "path", "") == "/ws")
+
+        # 0.6s @ 48 kHz sine wave streamed in 2048-sample int16 binary frames
+        t = np.linspace(0.0, 0.6, 28800, endpoint=False, dtype=np.float32)
+        sig = (0.25 * np.sin(2.0 * np.pi * 440.0 * t)).astype(np.float32)
+        pcm16 = np.round(sig * 32767.0).astype("<i2")
+
+        incoming: asyncio.Queue[dict] = asyncio.Queue()
+        # Rapid double audio_stream_start (cid=1 superseded by cid=2) + stale cid=1 frame
+        incoming.put_nowait(
+            {"type": "websocket.receive", "text": '{"type":"audio_stream_start","capture_id":1,"sample_rate":48000,"format":"i16"}'}
+        )
+        incoming.put_nowait(
+            {"type": "websocket.receive", "bytes": struct.pack("<I", 1) + pcm16[:2048].tobytes()}
+        )
+        incoming.put_nowait(
+            {"type": "websocket.receive", "text": '{"type":"audio_stream_start","capture_id":2,"sample_rate":48000,"format":"i16"}'}
+        )
+        # Stale frame for cid=1 must be silently ignored
+        incoming.put_nowait(
+            {"type": "websocket.receive", "bytes": struct.pack("<I", 1) + np.full(2048, 30000, dtype="<i2").tobytes()}
+        )
+        for off in range(0, pcm16.size, 2048):
+            chunk_bytes = struct.pack("<I", 2) + pcm16[off : off + 2048].tobytes()
+            incoming.put_nowait({"type": "websocket.receive", "bytes": chunk_bytes})
+        incoming.put_nowait(
+            {"type": "websocket.receive", "text": '{"type":"audio_stream_end","turn_id":42,"capture_id":2}'}
+        )
+
+        sent_json: list[dict] = []
+
+        class _BinaryFakeWS:
+            def __init__(self) -> None:
+                self.headers = {"origin": "http://127.0.0.1:8765"}
+
+            async def accept(self) -> None:
+                pass
+
+            async def close(self, code: int = 1000) -> None:
+                pass
+
+            async def receive(self) -> dict:
+                return await incoming.get()
+
+            async def send_json(self, payload: dict) -> None:
+                sent_json.append(payload)
+                if payload.get("type") == "audio_end" and payload.get("turn_id") == 42:
+                    incoming.put_nowait({"type": "websocket.disconnect"})
+
+            async def send_bytes(self, data: bytes) -> None:
+                pass
+
+        async def run_ws() -> None:
+            runtime.set_loop(asyncio.get_running_loop())
+            await ws_route.endpoint(_BinaryFakeWS())
+
+        asyncio.run(run_ws())
+
+        self.assertEqual(len(captured), 1)
+        audio_out, sr_out = captured[0]
+        self.assertEqual(sr_out, 16000)
+        # 0.6s @ 16 kHz = 9600 samples; must NOT contain the stale cid=1 2048-sample spike!
+        self.assertAlmostEqual(audio_out.size, 9600, delta=16)
+        self.assertLess(float(np.max(np.abs(audio_out))), 0.4)
+        self.assertTrue(any(m.get("type") == "audio_end" and m.get("turn_id") == 42 for m in sent_json))
+        self.assertIsNone(runtime.mic_owner)
+
+    def test_audio_stream_end_without_active_stream_returns_idle_ack(self) -> None:
+        """audio_stream_end after cancel or mismatch must emit state(idle) so UI never sticks."""
+        runtime = HalRuntime(
+            HalConfig(model="mock", steps=6),
+            stt=_FakeSTT(),
+            tts=_FakeTTS(),
+            brain_factory=lambda rt: QwenBrain(model="mock", enable_web_search=False),
+        )
+        router = create_hal_router(runtime)
+        ws_route = next(r for r in router.routes if getattr(r, "path", "") == "/ws")
+
+        incoming: asyncio.Queue[dict] = asyncio.Queue()
+        incoming.put_nowait(
+            {"type": "websocket.receive", "text": '{"type":"audio_stream_start","capture_id":5,"sample_rate":48000,"format":"i16"}'}
+        )
+        incoming.put_nowait(
+            {"type": "websocket.receive", "text": '{"type":"interrupt","silent":true}'}
+        )
+        incoming.put_nowait(
+            {"type": "websocket.receive", "text": '{"type":"audio_stream_end","turn_id":43,"capture_id":5}'}
+        )
+
+        sent_json: list[dict] = []
+
+        class _BinaryFakeWS:
+            def __init__(self) -> None:
+                self.headers = {"origin": "http://127.0.0.1:8765"}
+
+            async def accept(self) -> None:
+                pass
+
+            async def close(self, code: int = 1000) -> None:
+                pass
+
+            async def receive(self) -> dict:
+                return await incoming.get()
+
+            async def send_json(self, payload: dict) -> None:
+                sent_json.append(payload)
+                if payload.get("type") == "state" and payload.get("turn_id") == 43:
+                    incoming.put_nowait({"type": "websocket.disconnect"})
+
+            async def send_bytes(self, data: bytes) -> None:
+                pass
+
+        async def run_ws() -> None:
+            runtime.set_loop(asyncio.get_running_loop())
+            await ws_route.endpoint(_BinaryFakeWS())
+
+        asyncio.run(run_ws())
+        idles = [
+            m
+            for m in sent_json
+            if m.get("type") == "state" and m.get("turn_id") == 43 and m.get("state") == "idle"
+        ]
+        self.assertEqual(len(idles), 1)
+
+    def test_healthy_pipeline_completion_does_not_evict_http_pool_on_slow_producer_exit(self) -> None:
+        """Consumer draining ('done', None) must join healthy producer briefly without calling cancel_inflight."""
+        import time
+
+        cancel_calls = 0
+
+        class _SlowUnwindBrain:
+            model = "mock"
+            enable_web_search = False
+
+            def reset(self) -> None:
+                pass
+
+            def set_model(self, m: str) -> None:
+                self.model = m
+
+            def cancel_inflight(self, *, only_stopped: bool = False) -> None:
+                nonlocal cancel_calls
+                cancel_calls += 1
+
+            def stream_reply_sentences(self, user_text: str, stop_check=None):
+                try:
+                    yield "All systems nominal, Charles."
+                    return "All systems nominal, Charles."
+                finally:
+                    # Simulate microsecond-scale unwind after yielding final sentence
+                    time.sleep(0.01)
+
+        pipeline = HalPipeline(brain=_SlowUnwindBrain(), tts=_FakeTTS(), stt=_FakeSTT())
+        events: list[HalEvent] = []
+        cancel_ev = threading.Event()
+        res = pipeline.run_turn(
+            turn_id=55,
+            cancel_event=cancel_ev,
+            on_event=lambda ev: events.append(ev) or True,
+            user_text="Status?",
+        )
+        self.assertFalse(res.failed)
+        self.assertFalse(res.cancelled)
+        self.assertFalse(cancel_ev.is_set())
+        self.assertEqual(cancel_calls, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

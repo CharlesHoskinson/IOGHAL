@@ -70,6 +70,20 @@ export function decodeFramedPcm(buffer: ArrayBuffer): { turnId: number; pcm: Flo
   return { turnId, pcm };
 }
 
+/** Encode a float32 mic chunk as [4-byte LE uint32 captureId | LE int16 PCM] for live WS streaming. */
+export function encodeFramedInt16Pcm(captureId: number, samples: Float32Array): ArrayBuffer {
+  const buf = new ArrayBuffer(PCM_HEADER_BYTES + samples.length * 2);
+  const view = new DataView(buf);
+  view.setUint32(0, captureId >>> 0, true);
+  const pcm16 = new Int16Array(buf, PCM_HEADER_BYTES, samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    const clamped = s <= -1 ? -1 : s >= 1 ? 1 : s;
+    pcm16[i] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
+  }
+  return buf;
+}
+
 export interface AudioPlayerCallbacks {
   onPlaybackIdle: () => void;
   onSuspendedChange: (suspended: boolean) => void;

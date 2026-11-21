@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { HalEye, type HalState } from './HalEye';
 import {
   decodeFramedPcm,
+  encodeFramedInt16Pcm,
   HalAudioPlayer,
   type MicMode,
   type ServerMessage,
@@ -18,6 +19,8 @@ type CaptureOwner = { kind: 'space' } | { kind: 'pointer'; pointerId: number } |
 
 interface BrowserCaptureSession {
   gen: number;
+  captureId: number;
+  streaming: boolean;
   stream: MediaStream | null;
   source: MediaStreamAudioSourceNode | null;
   processor: ScriptProcessorNode | null;
@@ -230,6 +233,11 @@ export default function App() {
     sess.stream?.getTracks().forEach((t) => t.stop());
     sess.stream = null;
     if (discardChunks) {
+      if (sess.streaming && wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({ type: 'audio_stream_cancel', capture_id: sess.captureId }),
+        );
+      }
       sess.chunks = [];
       sess.samples = 0;
       return null;
@@ -262,14 +270,32 @@ export default function App() {
   const uploadBrowserSession = useCallback(
     (sess: BrowserCaptureSession | null) => {
       if (!sess || sess.samples === 0) {
+        if (sess?.streaming) {
+          sendJson({ type: 'audio_stream_cancel', capture_id: sess.captureId });
+        }
         setHalState('idle');
         setStatusText('ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK');
         return;
       }
       const durS = sess.samples / Math.max(sess.sampleRate, 1);
       if (durS < MIN_CAPTURE_DURATION_S) {
+        if (sess.streaming) {
+          sendJson({ type: 'audio_stream_cancel', capture_id: sess.captureId });
+        }
         setHalState('idle');
         setStatusText('AUDIO TOO SHORT — HOLD OR TAP SPACE TO TALK');
+        return;
+      }
+      const turnId = mintTurnId();
+      pendingTurnRef.current = true;
+      setHalState('thinking');
+      setStatusText('TRANSCRIBING SPEECH...');
+      if (sess.streaming) {
+        sendJson({
+          type: 'audio_stream_end',
+          turn_id: turnId,
+          capture_id: sess.captureId,
+        });
         return;
       }
       const merged = new Float32Array(sess.samples);
@@ -278,10 +304,6 @@ export default function App() {
         merged.set(c, offset);
         offset += c.length;
       }
-      const turnId = mintTurnId();
-      pendingTurnRef.current = true;
-      setHalState('thinking');
-      setStatusText('TRANSCRIBING SPEECH...');
       sendJson({
         type: 'audio_b64',
         turn_id: turnId,
@@ -592,7 +614,7 @@ export default function App() {
     };
   }, [appendEntry, resetLocalCaptureFlags, retireTurn, teardownBrowserSession]);
 
-  const startBrowserCapture = useCallback(async () => {
+  const startBrowserCapture = useCallback(async (captureId: number) => {
     const gen = ++browserGenRef.current;
     awaitingMicPermRef.current = true;
     let acquiredStream: MediaStream | null = null;
@@ -633,15 +655,28 @@ export default function App() {
       const sinkGain = ctx.createGain();
       sinkGain.gain.value = 0;
 
+      const sr = ctx.sampleRate || 48000;
+      const wsOpen = wsRef.current?.readyState === WebSocket.OPEN;
+      if (wsOpen) {
+        sendJson({
+          type: 'audio_stream_start',
+          capture_id: captureId,
+          sample_rate: sr,
+          format: 'i16',
+        });
+      }
+
       const session: BrowserCaptureSession = {
         gen,
+        captureId,
+        streaming: wsOpen,
         stream,
         source,
         processor,
         sinkGain,
         chunks: [],
         samples: 0,
-        sampleRate: ctx.sampleRate || 48000,
+        sampleRate: sr,
       };
       const maxSamples = Math.floor(session.sampleRate * MAX_CAPTURE_DURATION_S);
       browserSessionRef.current = session;
@@ -653,7 +688,12 @@ export default function App() {
         if (remaining <= 0) return;
         const copy =
           ch.length > remaining ? new Float32Array(ch.subarray(0, remaining)) : new Float32Array(ch);
-        session.chunks.push(copy);
+        if (session.streaming && wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(encodeFramedInt16Pcm(session.captureId, copy));
+        } else {
+          session.streaming = false;
+          session.chunks.push(copy);
+        }
         session.samples += copy.length;
         let sumSq = 0;
         for (let i = 0; i < copy.length; i++) sumSq += copy[i] * copy[i];
@@ -686,7 +726,7 @@ export default function App() {
       setHalState('idle');
       setStatusText('ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK');
     }
-  }, [appendEntry, finishRecording, localMicAllowed, resetLocalCaptureFlags, teardownBrowserSession]);
+  }, [appendEntry, finishRecording, localMicAllowed, resetLocalCaptureFlags, sendJson, teardownBrowserSession]);
 
   const beginRecording = useCallback(
     (owner: CaptureOwner) => {
@@ -714,7 +754,7 @@ export default function App() {
 
       if (mode === 'browser') {
         sendJson({ type: 'interrupt', silent: true });
-        void startBrowserCapture();
+        void startBrowserCapture(cid);
       } else {
         sendJson({ type: 'ptt_start', capture_id: cid });
       }

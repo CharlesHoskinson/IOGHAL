@@ -248,6 +248,7 @@ class HalPipeline:
                 target=_llm_producer, name=f"hal-llm-{turn_id}", daemon=True
             )
             producer_thread.start()
+            producer_done = False
 
             while True:
                 if cancel_event.is_set():
@@ -261,6 +262,7 @@ class HalPipeline:
                     continue
 
                 if kind == "done":
+                    producer_done = True
                     break
                 if kind == "error":
                     assert isinstance(payload, Exception)
@@ -410,10 +412,15 @@ class HalPipeline:
             if cancel_event.is_set() and not result.failed:
                 result.cancelled = True
             if producer_thread is not None and producer_thread.is_alive():
-                cancel_event.set()
-                # Quint Bug 2b fix: abort any open LLM HTTP stream immediately to release --parallel 1 slot
-                _cancel_brain_inflight(self.brain)
-                producer_thread.join(timeout=1.0)
+                if producer_done and not cancel_event.is_set() and not result.failed:
+                    # Healthy producer already sent ("done", None); let it unwind without
+                    # setting cancel_event or evicting the warm HTTP keep-alive pool.
+                    producer_thread.join(timeout=0.05)
+                if producer_thread.is_alive():
+                    cancel_event.set()
+                    # Quint Bug 2b fix: abort any open LLM HTTP stream immediately to release --parallel 1 slot
+                    _cancel_brain_inflight(self.brain)
+                    producer_thread.join(timeout=1.0)
             if audio_started and not audio_ended:
                 audio_ended = True
                 emit(

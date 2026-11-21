@@ -60,6 +60,82 @@ MAX_UPLOAD_DURATION_S = 30.0
 MIN_AUDIO_DURATION_S = 0.2
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _LE_FLOAT32 = np.dtype("<f4")
+_STT_TARGET_SR = 16000
+_PCM_HEADER_BYTES = 4
+
+
+class _StreamingAudioCapture:
+    """Per-connection incremental browser mic capture with live C++ SIMD 16 kHz resampling."""
+
+    def __init__(
+        self,
+        capture_id: int,
+        sample_rate: int,
+        fmt: Literal["i16", "f32"] = "i16",
+    ) -> None:
+        self.capture_id = capture_id
+        self.sample_rate = sample_rate
+        self.fmt = fmt
+        self.max_input_samples = int(sample_rate * MAX_UPLOAD_DURATION_S)
+        self.input_samples = 0
+        self.overflowed = False
+        self.invalid_sample = False
+        self.chunks: list[np.ndarray] = []
+        self._resampler: Any | None = None
+        self.output_sr = sample_rate
+        if sample_rate != _STT_TARGET_SR:
+            try:
+                import soxr
+
+                self._resampler = soxr.ResampleStream(
+                    sample_rate, _STT_TARGET_SR, num_channels=1, dtype="float32"
+                )
+                self.output_sr = _STT_TARGET_SR
+            except (ImportError, RuntimeError, ValueError, OSError):
+                self._resampler = None
+                self.output_sr = sample_rate
+
+    def append_bytes(self, payload: bytes) -> bool:
+        if not payload or self.overflowed or self.invalid_sample:
+            return False
+        if self.fmt == "i16":
+            if len(payload) % 2 != 0:
+                self.invalid_sample = True
+                return False
+            arr = np.frombuffer(payload, dtype="<i2").astype(np.float32) * (1.0 / 32768.0)
+        else:
+            if len(payload) % 4 != 0:
+                self.invalid_sample = True
+                return False
+            arr = np.frombuffer(payload, dtype="<f4").copy()
+            if not np.all(np.isfinite(arr)):
+                self.invalid_sample = True
+                return False
+        if arr.size == 0:
+            return True
+        if self.input_samples + arr.size > self.max_input_samples:
+            self.overflowed = True
+            return False
+        self.input_samples += arr.size
+        if self._resampler is not None:
+            out = self._resampler.resample_chunk(arr, last=False)
+            if out.size > 0:
+                self.chunks.append(np.ascontiguousarray(out, dtype=np.float32))
+        else:
+            self.chunks.append(arr)
+        return True
+
+    def finish(self) -> tuple[np.ndarray, int]:
+        if self._resampler is not None:
+            tail = self._resampler.resample_chunk(np.zeros(0, dtype=np.float32), last=True)
+            if tail.size > 0:
+                self.chunks.append(np.ascontiguousarray(tail, dtype=np.float32))
+            self._resampler = None
+        if not self.chunks:
+            return np.zeros(0, dtype=np.float32), self.output_sr
+        if len(self.chunks) == 1:
+            return self.chunks[0], self.output_sr
+        return np.concatenate(self.chunks).astype(np.float32, copy=False), self.output_sr
 
 
 def is_allowed_origin(
@@ -575,6 +651,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
         turn_gen = 0
         active_cancel = threading.Event()
         active_capture_id: int | None = None
+        stream_capture: _StreamingAudioCapture | None = None
         last_level_ts = 0.0
 
         # Queue holds (kind, payload, gen_or_none) so retired audio is discarded before transmission
@@ -809,9 +886,30 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                 "json", runtime.status_payload(model=brain.model, steps=conn_steps)
             )
             while not ws_closed.is_set():
-                try:
-                    raw = await ws.receive_text()
-                except KeyError:
+                if hasattr(ws, "receive"):
+                    ws_msg = await ws.receive()
+                    if ws_msg.get("type") == "websocket.disconnect":
+                        break
+                    raw_bytes = ws_msg.get("bytes")
+                    raw = ws_msg.get("text")
+                else:
+                    raw_bytes = None
+                    try:
+                        raw = await ws.receive_text()
+                    except KeyError:
+                        continue
+
+                if raw_bytes is not None:
+                    if (
+                        stream_capture is not None
+                        and len(raw_bytes) > _PCM_HEADER_BYTES
+                    ):
+                        (frame_cid,) = struct.unpack("<I", raw_bytes[:_PCM_HEADER_BYTES])
+                        if frame_cid == stream_capture.capture_id:
+                            stream_capture.append_bytes(raw_bytes[_PCM_HEADER_BYTES:])
+                    continue
+
+                if raw is None:
                     continue
                 try:
                     msg = json.loads(raw)
@@ -827,6 +925,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                 capture_id = _parse_positive_int(msg.get("capture_id"))
 
                 if mtype == "ptt_start":
+                    stream_capture = None
                     if not runtime.ready:
                         enqueue_on_loop(
                             "json",
@@ -935,7 +1034,116 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                             daemon=True,
                         ).start()
 
+                elif mtype == "audio_stream_start":
+                    stream_capture = None
+                    if not runtime.ready:
+                        enqueue_on_loop(
+                            "json",
+                            {
+                                "type": "capture_failed",
+                                "capture_id": capture_id,
+                                "message": "IOGHAL is still initializing.",
+                            },
+                        )
+                        continue
+                    sr = msg.get("sample_rate", 48000)
+                    fmt = msg.get("format", "i16")
+                    if (
+                        capture_id is None
+                        or fmt not in ("i16", "f32")
+                        or isinstance(sr, bool)
+                        or not isinstance(sr, int)
+                        or not (MIN_SAMPLE_RATE <= sr <= MAX_SAMPLE_RATE)
+                    ):
+                        enqueue_on_loop(
+                            "json",
+                            {
+                                "type": "capture_failed",
+                                "capture_id": capture_id,
+                                "message": "Invalid streaming audio parameters.",
+                            },
+                        )
+                        continue
+                    cancel_active_turn()
+                    if mic.is_recording:
+                        await stop_local_mic_async()
+                    stream_capture = _StreamingAudioCapture(
+                        capture_id=capture_id,
+                        sample_rate=sr,
+                        fmt=fmt,  # type: ignore[arg-type]
+                    )
+                    logger.info(
+                        "Browser audio stream started (capture_id=%d, sr=%d -> %d Hz, fmt=%s)",
+                        capture_id,
+                        sr,
+                        stream_capture.output_sr,
+                        fmt,
+                    )
+
+                elif mtype == "audio_stream_cancel":
+                    if stream_capture is not None and (
+                        capture_id is None or stream_capture.capture_id == capture_id
+                    ):
+                        stream_capture = None
+
+                elif mtype == "audio_stream_end":
+                    cap = stream_capture
+                    stream_capture = None
+                    if not runtime.ready:
+                        reject_turn(
+                            client_tid,
+                            "IOGHAL is still initializing.",
+                            "INITIALIZING NEURAL SUBSYSTEMS...",
+                        )
+                        continue
+                    if cap is None or (capture_id is not None and cap.capture_id != capture_id):
+                        enqueue_on_loop(
+                            "json",
+                            {
+                                "type": "state",
+                                "turn_id": client_tid,
+                                "state": "idle",
+                                "detail": "ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK",
+                            },
+                        )
+                        continue
+                    if cap.invalid_sample:
+                        reject_turn(client_tid, "Invalid streamed audio samples.")
+                        continue
+                    if cap.overflowed:
+                        reject_turn(
+                            client_tid,
+                            f"Audio exceeds {int(MAX_UPLOAD_DURATION_S)}s limit.",
+                        )
+                        continue
+                    audio, out_sr = cap.finish()
+                    dur_s = audio.size / float(max(out_sr, 1))
+                    if dur_s < MIN_AUDIO_DURATION_S:
+                        enqueue_on_loop(
+                            "json",
+                            {
+                                "type": "state",
+                                "turn_id": client_tid,
+                                "state": "idle",
+                                "detail": "AUDIO TOO SHORT — HOLD OR TAP SPACE TO TALK",
+                            },
+                        )
+                        continue
+                    logger.info(
+                        "Browser audio stream finished: %.2fs @ %d Hz (pre-resampled)",
+                        dur_s,
+                        out_sr,
+                    )
+                    wire_tid, my_gen, turn_cancel = begin_turn(client_tid)
+                    threading.Thread(
+                        target=run_turn_worker,
+                        args=(wire_tid, my_gen, turn_cancel),
+                        kwargs={"audio": audio, "sample_rate": out_sr, "steps": conn_steps},
+                        daemon=True,
+                    ).start()
+
                 elif mtype == "audio_b64":
+                    stream_capture = None
                     if not runtime.ready:
                         reject_turn(client_tid, "IOGHAL is still initializing.", "INITIALIZING NEURAL SUBSYSTEMS...")
                         continue
@@ -1007,6 +1215,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                     ).start()
 
                 elif mtype == "text":
+                    stream_capture = None
                     raw_text = msg.get("text")
                     if not isinstance(raw_text, str):
                         enqueue_on_loop(
@@ -1054,6 +1263,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                     ).start()
 
                 elif mtype == "interrupt":
+                    stream_capture = None
                     cancel_active_turn()
                     if mic.is_recording:
                         await stop_local_mic_async()
@@ -1103,6 +1313,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                         )
 
                 elif mtype == "reset":
+                    stream_capture = None
                     cancel_active_turn()
                     if mic.is_recording:
                         await stop_local_mic_async()
@@ -1113,6 +1324,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
             pass
         finally:
             ws_closed.set()
+            stream_capture = None
             cancel_active_turn()
             runtime._listeners.pop(ws, None)
             runtime._active_closers.pop(ws, None)

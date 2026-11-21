@@ -40,6 +40,10 @@ module ioghal_protocol {
   type C2SMsg =
     | MsgPttStart({ cid: int })
     | MsgPttStop({ tid: int, cid: int })
+    | MsgAudioStreamStart({ cid: int, valid: bool })
+    | MsgAudioStreamChunk({ cid: int, valid: bool })
+    | MsgAudioStreamEnd({ tid: int, cid: int })
+    | MsgAudioStreamCancel({ cid: int })
     | MsgAudioB64({ tid: int, valid: bool })
     | MsgText({ tid: int })
     | MsgInterrupt({ tid: int, silent: bool })
@@ -100,6 +104,9 @@ module ioghal_protocol {
     micRecording: bool,
     micCaptureId: int,
     micLimitHit: bool,
+    streamCaptureActive: bool,
+    streamCaptureId: int,
+    streamValid: bool,
     lastSubmittedTid: int,
     historyPoisoned: bool,
   }
@@ -132,6 +139,9 @@ module ioghal_protocol {
     replaySuspendedGuard: bool,
     rapidDoublePtt: bool,
     disconnectDuringActivePipeline: bool,
+    browserStreamTurn: bool,
+    browserStreamBargeIn: bool,
+    browserStreamRapidDouble: bool,
   }
 
   var clients: int -> ClientState
@@ -184,6 +194,9 @@ module ioghal_protocol {
     micRecording: false,
     micCaptureId: 0,
     micLimitHit: false,
+    streamCaptureActive: false,
+    streamCaptureId: 0,
+    streamValid: true,
     lastSubmittedTid: 0,
     historyPoisoned: false,
   }
@@ -210,6 +223,9 @@ module ioghal_protocol {
     replaySuspendedGuard: false,
     rapidDoublePtt: false,
     disconnectDuringActivePipeline: false,
+    browserStreamTurn: false,
+    browserStreamBargeIn: false,
+    browserStreamRapidDouble: false,
   }
 
   pure def isClientGpuHolder(h: GpuHolder, id: int): bool =
@@ -321,6 +337,78 @@ module ioghal_protocol {
 
   // Models a rapid duplicate MsgPttStart arriving on the wire while already recording locally
   // (e.g., scripted client or reconnect/race). Server must restart mic cleanly & clear micLimitHit.
+  // Models live browser mic streaming start (`audio_stream_start`), incremental binary PCM frames
+  // (`audio_stream_chunk`), rapid double-start, and near-0ms `audio_stream_end` release.
+  action clientBrowserStreamStart(id: int, validStart: bool): bool = {
+    val c = clients.get(id)
+    val cid = c.activeCaptureId
+    all {
+      c.connected,
+      c.pttActive,
+      c.captureMode == ModeBrowser,
+      cid > 0,
+      c2s.get(id).length() < 6,
+      c2s' = c2s.put(id, c2s.get(id).append(MsgAudioStreamStart({ cid: cid, valid: validStart }))),
+      clients' = clients,
+      servers' = servers,
+      s2c' = s2c,
+      hw' = hw,
+      cov' = cov,
+    }
+  }
+
+  action clientBrowserStreamChunk(id: int, cid: int, validChunk: bool): bool = {
+    val c = clients.get(id)
+    all {
+      c.connected,
+      c.pttActive,
+      c.captureMode == ModeBrowser,
+      cid > 0,
+      c2s.get(id).length() < 6,
+      c2s' = c2s.put(id, c2s.get(id).append(MsgAudioStreamChunk({ cid: cid, valid: validChunk }))),
+      clients' = clients,
+      servers' = servers,
+      s2c' = s2c,
+      hw' = hw,
+      cov' = cov,
+    }
+  }
+
+  action clientFinishBrowserStream(id: int): bool = {
+    val c = clients.get(id)
+    val tid = c.nextTurnId
+    val cid = c.activeCaptureId
+    all {
+      c.connected,
+      c.pttActive,
+      c.captureMode == ModeBrowser,
+      c.nextTurnId < MAX_TURN_ID,
+      clients' = clients.put(id, {
+        ...c,
+        uiState: UiThinking,
+        pttActive: false,
+        latched: false,
+        owner: NoOwner,
+        activeTurnId: tid,
+        nextTurnId: tid + 1,
+        activeCaptureId: 0,
+        pendingTurn: true,
+        audioOpenTid: 0,
+      }),
+      c2s' = c2s.put(id, c2s.get(id).append(MsgAudioStreamEnd({ tid: tid, cid: cid }))),
+      servers' = servers,
+      s2c' = s2c,
+      hw' = hw,
+      cov' = {
+        ...cov,
+        pttTurn: true,
+        browserTurn: true,
+        browserStreamTurn: true,
+        resetThenTurn: cov.resetThenTurn or (c.lastClearedTurnId > 0),
+      },
+    }
+  }
+
   action clientRapidDoublePtt(id: int): bool = {
     val c = clients.get(id)
     val cid = c.nextCaptureId
@@ -743,6 +831,9 @@ module ioghal_protocol {
         micRecording: false,
         micCaptureId: 0,
         micLimitHit: false,
+        streamCaptureActive: false,
+        streamCaptureId: 0,
+        streamValid: true,
       }),
       c2s' = c2s.put(id, List()),
       s2c' = s2c.put(id, List()),
@@ -804,6 +895,9 @@ module ioghal_protocol {
                 micRecording: true,
                 micCaptureId: p.cid,
                 micLimitHit: false,
+                streamCaptureActive: false,
+                streamCaptureId: 0,
+                streamValid: true,
               }),
               hw' = { ...hw, micOwner: id },
               s2c' = s2c.put(id, s2c.get(id).append(EvState({ tid: 0, cid: p.cid, ui: UiListening }))),
@@ -873,6 +967,153 @@ module ioghal_protocol {
               }
             }
           }
+        | MsgAudioStreamStart(p) => {
+            val wasThinking = s.llmThinkingSelf
+            val wasStreamActive = s.streamCaptureActive
+            if (not(p.valid)) all {
+              servers' = servers.put(id, {
+                ...s,
+                streamCaptureActive: false,
+                streamCaptureId: 0,
+                streamValid: true,
+              }),
+              hw' = hw,
+              s2c' = s2c.put(id, s2c.get(id).append(EvCaptureFailed({ cid: p.cid }))),
+              c2s' = c2s.put(id, rest),
+              clients' = clients,
+              cov' = cov,
+            } else all {
+              servers' = servers.put(id, {
+                ...s,
+                turnGen: s.turnGen + 1,
+                workerStage: WorkerIdle,
+                llmStreamActive: false,
+                llmThinkingSelf: false,
+                ttsHoldingGpu: false,
+                sttHoldingGpu: false,
+                queuedSentences: 0,
+                llmDone: true,
+                llmFailed: false,
+                micRecording: false,
+                micCaptureId: 0,
+                micLimitHit: false,
+                streamCaptureActive: true,
+                streamCaptureId: p.cid,
+                streamValid: true,
+              }),
+              hw' = { ...hw, micOwner: if (hw.micOwner == id) 0 else hw.micOwner },
+              s2c' = s2c,
+              c2s' = c2s.put(id, rest),
+              clients' = clients,
+              cov' = {
+                ...cov,
+                thinkingSelfBargeIn: cov.thinkingSelfBargeIn or wasThinking,
+                browserStreamRapidDouble: cov.browserStreamRapidDouble or wasStreamActive,
+              },
+            }
+          }
+        | MsgAudioStreamChunk(p) => {
+            val matched = s.streamCaptureActive and s.streamCaptureId == p.cid
+            all {
+              servers' = if (matched) servers.put(id, {
+                ...s,
+                streamValid: s.streamValid and p.valid,
+              }) else servers,
+              hw' = hw,
+              s2c' = s2c,
+              c2s' = c2s.put(id, rest),
+              clients' = clients,
+              cov' = cov,
+            }
+          }
+        | MsgAudioStreamCancel(p) => {
+            val shouldClear = s.streamCaptureActive and (p.cid == 0 or s.streamCaptureId == p.cid)
+            all {
+              servers' = if (shouldClear) servers.put(id, {
+                ...s,
+                streamCaptureActive: false,
+                streamCaptureId: 0,
+                streamValid: true,
+              }) else servers,
+              hw' = hw,
+              s2c' = s2c,
+              c2s' = c2s.put(id, rest),
+              clients' = clients,
+              cov' = cov,
+            }
+          }
+        | MsgAudioStreamEnd(p) => {
+            val matched = s.streamCaptureActive and s.streamCaptureId == p.cid
+            if (not(matched)) all {
+              servers' = servers.put(id, {
+                ...s,
+                streamCaptureActive: false,
+                streamCaptureId: 0,
+                streamValid: true,
+              }),
+              hw' = hw,
+              s2c' = s2c.put(id, s2c.get(id).append(EvState({ tid: p.tid, cid: 0, ui: UiIdle }))),
+              c2s' = c2s.put(id, rest),
+              clients' = clients,
+              cov' = cov,
+            } else if (not(s.streamValid)) all {
+              servers' = servers.put(id, {
+                ...s,
+                turnGen: s.turnGen + 1,
+                workerStage: WorkerIdle,
+                llmStreamActive: false,
+                llmThinkingSelf: false,
+                ttsHoldingGpu: false,
+                sttHoldingGpu: false,
+                queuedSentences: 0,
+                llmDone: true,
+                llmFailed: false,
+                streamCaptureActive: false,
+                streamCaptureId: 0,
+                streamValid: true,
+              }),
+              hw' = hw,
+              s2c' = s2c.put(id, s2c.get(id).concat(List(
+                EvError({ tid: p.tid }),
+                EvState({ tid: p.tid, cid: 0, ui: UiIdle }),
+              ))),
+              c2s' = c2s.put(id, rest),
+              clients' = clients,
+              cov' = { ...cov, invalidAudioRecovery: true },
+            } else {
+              val nextGen = s.turnGen + 1
+              all {
+                servers' = servers.put(id, {
+                  ...s,
+                  turnGen: nextGen,
+                  micRecording: false,
+                  micCaptureId: 0,
+                  micLimitHit: false,
+                  streamCaptureActive: false,
+                  streamCaptureId: 0,
+                  streamValid: true,
+                  workerStage: WorkerStt,
+                  workerWireTid: p.tid,
+                  workerGen: nextGen,
+                  workerHistoryGen: s.historyGen,
+                  workerAudioStarted: false,
+                  llmStreamActive: false,
+                  llmThinkingSelf: false,
+                  llmDone: false,
+                  llmFailed: false,
+                  queuedSentences: 0,
+                  ttsHoldingGpu: false,
+                  sttHoldingGpu: false,
+                  lastSubmittedTid: p.tid,
+                }),
+                hw' = { ...hw, micOwner: if (hw.micOwner == id) 0 else hw.micOwner },
+                s2c' = s2c,
+                c2s' = c2s.put(id, rest),
+                clients' = clients,
+                cov' = { ...cov, browserStreamTurn: true },
+              }
+            }
+          }
         | MsgAudioB64(p) => {
             if (not(p.valid)) all {
               // Invalid upload: emit turn-scoped error AND idle state so client never sticks in UiThinking
@@ -890,6 +1131,9 @@ module ioghal_protocol {
                 micRecording: false,
                 micCaptureId: 0,
                 micLimitHit: false,
+                streamCaptureActive: false,
+                streamCaptureId: 0,
+                streamValid: true,
               }),
               hw' = { ...hw, micOwner: if (hw.micOwner == id) 0 else hw.micOwner },
               s2c' = s2c.put(id, s2c.get(id).concat(List(
@@ -908,6 +1152,9 @@ module ioghal_protocol {
                   micRecording: false,
                   micCaptureId: 0,
                   micLimitHit: false,
+                  streamCaptureActive: false,
+                  streamCaptureId: 0,
+                  streamValid: true,
                   workerStage: WorkerStt,
                   workerWireTid: p.tid,
                   workerGen: nextGen,
@@ -940,6 +1187,9 @@ module ioghal_protocol {
                 micRecording: false,
                 micCaptureId: 0,
                 micLimitHit: false,
+                streamCaptureActive: false,
+                streamCaptureId: 0,
+                streamValid: true,
                 workerStage: WorkerSearch,
                 workerWireTid: p.tid,
                 workerGen: nextGen,
@@ -964,6 +1214,7 @@ module ioghal_protocol {
         | MsgInterrupt(p) => {
             val outEv = if (p.silent) List() else List(EvState({ tid: p.tid, cid: 0, ui: UiIdle }))
             val wasThinking = s.llmThinkingSelf
+            val wasStreaming = s.streamCaptureActive
             all {
               servers' = servers.put(id, {
                 ...s,
@@ -979,12 +1230,19 @@ module ioghal_protocol {
                 micRecording: false,
                 micCaptureId: 0,
                 micLimitHit: false,
+                streamCaptureActive: false,
+                streamCaptureId: 0,
+                streamValid: true,
               }),
               hw' = { ...hw, micOwner: if (hw.micOwner == id) 0 else hw.micOwner },
               s2c' = s2c.put(id, s2c.get(id).concat(outEv)),
               c2s' = c2s.put(id, rest),
               clients' = clients,
-              cov' = { ...cov, thinkingSelfBargeIn: cov.thinkingSelfBargeIn or wasThinking },
+              cov' = {
+                ...cov,
+                thinkingSelfBargeIn: cov.thinkingSelfBargeIn or wasThinking,
+                browserStreamBargeIn: cov.browserStreamBargeIn or wasStreaming,
+              },
             }
           }
         | MsgReset(p) => {
@@ -1005,6 +1263,9 @@ module ioghal_protocol {
                 micRecording: false,
                 micCaptureId: 0,
                 micLimitHit: false,
+                streamCaptureActive: false,
+                streamCaptureId: 0,
+                streamValid: true,
               }),
               hw' = { ...hw, micOwner: if (hw.micOwner == id) 0 else hw.micOwner },
               s2c' = s2c.put(id, s2c.get(id).append(EvCleared({ tid: p.tid }))),
@@ -1396,6 +1657,11 @@ module ioghal_protocol {
       clientBeginPtt(id, SpaceOwner),
       clientBeginPtt(id, PointerOwner),
       clientBeginPtt(id, ToggleOwner),
+      clientBrowserStreamStart(id, true),
+      clientBrowserStreamStart(id, false),
+      clientBrowserStreamChunk(id, clients.get(id).activeCaptureId, true),
+      clientBrowserStreamChunk(id, clients.get(id).activeCaptureId, false),
+      clientFinishBrowserStream(id),
       clientRapidDoublePtt(id),
       clientTapLatch(id),
       clientFinishPtt(id, true),
@@ -1534,6 +1800,12 @@ module ioghal_protocol {
   val invNoPoisonedHistory: bool =
     CLIENTS.forall(i => not(servers.get(i).historyPoisoned))
 
+  // 16. Disconnected server connections NEVER leak an active browser streaming audio buffer.
+  val invNoOrphanedStreamCapture: bool =
+    CLIENTS.forall(i =>
+      not(servers.get(i).connected) implies not(servers.get(i).streamCaptureActive)
+    )
+
   val allInvariants: bool = and {
     invExclusiveMicOwnership,
     invNoOrphanedMic,
@@ -1550,6 +1822,7 @@ module ioghal_protocol {
     invNoLeakedLlmStreamWhenIdle,
     invNoReplayWhileAudioSuspended,
     invNoPoisonedHistory,
+    invNoOrphanedStreamCapture,
   }
 
   // --- Reachability Witnesses ---
@@ -1574,4 +1847,7 @@ module ioghal_protocol {
   val wReplaySuspendedGuard: bool = cov.replaySuspendedGuard
   val wRapidDoublePtt: bool = cov.rapidDoublePtt
   val wDisconnectDuringActivePipeline: bool = cov.disconnectDuringActivePipeline
+  val wBrowserStreamTurn: bool = cov.browserStreamTurn
+  val wBrowserStreamBargeIn: bool = cov.browserStreamBargeIn
+  val wBrowserStreamRapidDouble: bool = cov.browserStreamRapidDouble
 }
