@@ -22,6 +22,7 @@ from ._cuda_ops import (
     FP8Linear,
     capture_cuda_graph,
     probe_fp8_supported,
+    quantize_rowwise_fp8,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,148 @@ HAL_WHISPER_PROMPT = (
     "HAL 9000, Charles, Dave Bowman, Frank Poole, Dr. Chandra, Discovery One, "
     "Alexei Leonov, AE-35, TMA-1, Europa, Monolith, pod bay doors."
 )
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _layernorm_fp8_quant_kernel(
+        x_ptr,
+        w_ptr,
+        b_ptr,
+        y_ptr,
+        s_ptr,
+        n_cols,
+        inv_n_cols,
+        stride_x,
+        stride_y,
+        eps,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+        mean = tl.sum(x, axis=0) * inv_n_cols
+        diff = tl.where(mask, x - mean, 0.0)
+        var = tl.sum(diff * diff, axis=0) * inv_n_cols
+        rstd = tl.math.rsqrt(var + eps)
+        w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        y = tl.where(mask, diff * rstd * w + b, 0.0)
+        amax = tl.max(tl.abs(y), axis=0)
+        scale = tl.maximum(amax, 1e-12) / 448.0
+        tl.store(s_ptr + row, scale)
+        q = tl.clamp(y / scale, -448.0, 448.0).to(tl.float8e4nv)
+        tl.store(y_ptr + row * stride_y + cols, q, mask=mask)
+
+    @triton.jit
+    def _gelu_fp8_quant_kernel(
+        x_ptr,
+        y_ptr,
+        s_ptr,
+        n_cols,
+        stride_x,
+        stride_y,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+        y = x * 0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476))
+        y = tl.where(mask, y, 0.0)
+        amax = tl.max(tl.abs(y), axis=0)
+        scale = tl.maximum(amax, 1e-12) / 448.0
+        tl.store(s_ptr + row, scale)
+        q = tl.clamp(y / scale, -448.0, 448.0).to(tl.float8e4nv)
+        tl.store(y_ptr + row * stride_y + cols, q, mask=mask)
+
+    _STT_TRITON_AVAILABLE = True
+except (ImportError, RuntimeError, OSError):
+    _STT_TRITON_AVAILABLE = False
+
+
+def _fp8_mm_prequant(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    lin: FP8Linear,
+    orig_shape: torch.Size,
+) -> torch.Tensor:
+    """Execute FP8Linear matmul from pre-quantized rowwise FP8 activations."""
+    out = torch._scaled_mm(
+        x_fp8,
+        lin.w_t,
+        scale_a=x_scale,
+        scale_b=lin.w_scale,
+        bias=lin.bias,
+        out_dtype=torch.bfloat16,
+    )
+    return out.view(*orig_shape[:-1], lin.out_features)
+
+
+def _layernorm_fp8_linear(x: torch.Tensor, ln: nn.LayerNorm, lin: nn.Module) -> torch.Tensor:
+    """Fused Triton LayerNorm + rowwise FP8 quant + FP8Linear (zero intermediate BF16 round-trip)."""
+    if (
+        _STT_TRITON_AVAILABLE
+        and isinstance(lin, FP8Linear)
+        and x.is_cuda
+        and ln.weight is not None
+        and ln.bias is not None
+    ):
+        n_cols = lin.in_features
+        block = triton.next_power_of_2(n_cols)
+        if block <= 8192:
+            x2d = x.reshape(-1, n_cols).contiguous()
+            m_rows = x2d.shape[0]
+            y_fp8 = torch.empty((m_rows, n_cols), device=x2d.device, dtype=torch.float8_e4m3fn)
+            s = torch.empty((m_rows, 1), device=x2d.device, dtype=torch.float32)
+            _layernorm_fp8_quant_kernel[(m_rows,)](
+                x2d,
+                ln.weight,
+                ln.bias,
+                y_fp8,
+                s,
+                n_cols,
+                1.0 / float(n_cols),
+                x2d.stride(0),
+                y_fp8.stride(0),
+                float(ln.eps),
+                BLOCK_SIZE=block,
+                num_warps=4 if block <= 2048 else 8,
+            )
+            return _fp8_mm_prequant(y_fp8, s, lin, x.shape)
+    return lin(ln(x))
+
+
+def _gelu_fp8_linear(x: torch.Tensor, act_fn, lin: nn.Module) -> torch.Tensor:
+    """Fused Triton exact-erf GELU + rowwise FP8 quant + FP8Linear (zero intermediate BF16 round-trip)."""
+    if (
+        _STT_TRITON_AVAILABLE
+        and isinstance(lin, FP8Linear)
+        and x.is_cuda
+        and (act_fn is F.gelu or type(act_fn).__name__ == "GELUActivation")
+    ):
+        n_cols = lin.in_features
+        block = triton.next_power_of_2(n_cols)
+        if block <= 8192:
+            x2d = x.reshape(-1, n_cols).contiguous()
+            m_rows = x2d.shape[0]
+            y_fp8 = torch.empty((m_rows, n_cols), device=x2d.device, dtype=torch.float8_e4m3fn)
+            s = torch.empty((m_rows, 1), device=x2d.device, dtype=torch.float32)
+            _gelu_fp8_quant_kernel[(m_rows,)](
+                x2d,
+                y_fp8,
+                s,
+                n_cols,
+                x2d.stride(0),
+                y_fp8.stride(0),
+                BLOCK_SIZE=block,
+                num_warps=4 if block <= 2048 else 8,
+            )
+            return _fp8_mm_prequant(y_fp8, s, lin, x.shape)
+    return lin(act_fn(x))
 
 
 def _has_speech_activity(audio: np.ndarray, sample_rate: int = 16000) -> bool:
@@ -139,6 +282,38 @@ def _fused_cross_attn_forward(
     )
     attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.embed_dim)
     return self.out_proj(attn_output), None
+
+
+def _fused_encoder_layer_forward(
+    self: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    """WhisperEncoderLayer forward with fused Triton LayerNorm+FP8 and GELU+FP8."""
+    residual = hidden_states
+    bsz, q_len, _ = hidden_states.shape
+    attn = self.self_attn
+    qkv = _layernorm_fp8_linear(hidden_states, self.self_attn_layer_norm, attn.qkv_proj)
+    q, k, v = qkv.chunk(3, dim=-1)
+    q = q.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+    k = k.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+    v = v.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+    attn_out = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=1.0,
+    )
+    attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, q_len, attn.embed_dim)
+    hidden_states = residual + attn.out_proj(attn_out)
+
+    residual = hidden_states
+    ffn = _layernorm_fp8_linear(hidden_states, self.final_layer_norm, self.fc1)
+    return residual + _gelu_fp8_linear(ffn, self.activation_fn, self.fc2)
 
 
 def _fuse_self_attn_fp8(attn: nn.Module) -> int:
@@ -275,6 +450,17 @@ def _quantize_whisper_fp8(model: nn.Module) -> int:
                 _walk(child)
 
     _walk(model)
+
+    if _STT_TRITON_AVAILABLE and enc is not None and hasattr(enc, "layers"):
+        for layer in enc.layers:
+            if (
+                hasattr(layer, "self_attn")
+                and isinstance(getattr(layer.self_attn, "qkv_proj", None), FP8Linear)
+                and isinstance(getattr(layer, "fc1", None), FP8Linear)
+                and isinstance(getattr(layer, "fc2", None), FP8Linear)
+            ):
+                layer.forward = types.MethodType(_fused_encoder_layer_forward, layer)
+
     return count
 
 
@@ -368,29 +554,39 @@ class _FastWhisperDecoder:
         mask[torch.tensor(valid, device=self.device, dtype=torch.long)] = True
         return mask
 
-    def _project_self_qkv(
-        self, attn: nn.Module, h: torch.Tensor, seq_len: int
+    def _project_self_qkv_ln(
+        self, attn: nn.Module, ln: nn.LayerNorm, h: torch.Tensor, seq_len: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hasattr(attn, "qkv_proj"):
-            q, k, v = attn.qkv_proj(h).chunk(3, dim=-1)
+            qkv = _layernorm_fp8_linear(h, ln, attn.qkv_proj)
+            q, k, v = qkv.chunk(3, dim=-1)
             if not getattr(attn, "_q_scaled", False):
                 q = q * attn.scaling
         else:
-            q = attn.q_proj(h)
+            normed = ln(h)
+            q = attn.q_proj(normed)
             if not getattr(attn, "_q_scaled", False):
                 q = q * attn.scaling
-            k = attn.k_proj(h)
-            v = attn.v_proj(h)
+            k = attn.k_proj(normed)
+            v = attn.v_proj(normed)
         q = q.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         return q, k, v
 
     def _project_cross_kv(
-        self, enc_attn: nn.Module, enc_hidden: torch.Tensor
+        self,
+        enc_attn: nn.Module,
+        enc_hidden: torch.Tensor,
+        enc_fp8_pair: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if hasattr(enc_attn, "kv_proj"):
-            k, v = enc_attn.kv_proj(enc_hidden).chunk(2, dim=-1)
+        kv_proj = getattr(enc_attn, "kv_proj", None)
+        if kv_proj is not None:
+            if enc_fp8_pair is not None and isinstance(kv_proj, FP8Linear):
+                kv = _fp8_mm_prequant(enc_fp8_pair[0], enc_fp8_pair[1], kv_proj, enc_hidden.shape)
+            else:
+                kv = kv_proj(enc_hidden)
+            k, v = kv.chunk(2, dim=-1)
         else:
             k = enc_attn.k_proj(enc_hidden)
             v = enc_attn.v_proj(enc_hidden)
@@ -398,8 +594,10 @@ class _FastWhisperDecoder:
         v = v.view(1, self.src_len, self.num_heads, self.head_dim).transpose(1, 2)
         return k, v
 
-    def _project_cross_q(self, enc_attn: nn.Module, h: torch.Tensor, seq_len: int) -> torch.Tensor:
-        q = enc_attn.q_proj(h)
+    def _project_cross_q_ln(
+        self, enc_attn: nn.Module, ln: nn.LayerNorm, h: torch.Tensor, seq_len: int
+    ) -> torch.Tensor:
+        q = _layernorm_fp8_linear(h, ln, enc_attn.q_proj)
         if not getattr(enc_attn, "_q_scaled", False):
             q = q * enc_attn.scaling
         return q.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -407,10 +605,17 @@ class _FastWhisperDecoder:
     def _prefill_fn(self) -> None:
         h = self.decoder.embed_tokens(self._static_prefix_ids) + self._static_prefix_pos
         p_len = self.prefix_len
+        # Quantize static encoder_hidden_states ONCE for all 32 cross-attention kv_proj FP8 GEMMs
+        first_enc = self.decoder.layers[0].encoder_attn if self.decoder.layers else None
+        enc_fp8_pair = (
+            quantize_rowwise_fp8(self._static_enc_hidden.reshape(-1, self.embed_dim))
+            if first_enc is not None and isinstance(getattr(first_enc, "kv_proj", None), FP8Linear)
+            else None
+        )
+
         for idx, layer in enumerate(self.decoder.layers):
             residual = h
-            normed = layer.self_attn_layer_norm(h)
-            q, k, v = self._project_self_qkv(layer.self_attn, normed, p_len)
+            q, k, v = self._project_self_qkv_ln(layer.self_attn, layer.self_attn_layer_norm, h, p_len)
             self._self_k[idx][:, :, :p_len, :].copy_(k)
             self._self_v[idx][:, :, :p_len, :].copy_(v)
             attn_out = F.scaled_dot_product_attention(
@@ -420,11 +625,12 @@ class _FastWhisperDecoder:
             h = residual + layer.self_attn.out_proj(attn_out)
 
             residual = h
-            normed = layer.encoder_attn_layer_norm(h)
-            ck, cv = self._project_cross_kv(layer.encoder_attn, self._static_enc_hidden)
+            ck, cv = self._project_cross_kv(
+                layer.encoder_attn, self._static_enc_hidden, enc_fp8_pair
+            )
             self._cross_k[idx].copy_(ck)
             self._cross_v[idx].copy_(cv)
-            cq = self._project_cross_q(layer.encoder_attn, normed, p_len)
+            cq = self._project_cross_q_ln(layer.encoder_attn, layer.encoder_attn_layer_norm, h, p_len)
             cross_out = F.scaled_dot_product_attention(
                 cq,
                 self._cross_k[idx],
@@ -437,8 +643,8 @@ class _FastWhisperDecoder:
             h = residual + layer.encoder_attn.out_proj(cross_out)
 
             residual = h
-            normed = layer.final_layer_norm(h)
-            h = residual + layer.fc2(layer.activation_fn(layer.fc1(normed)))
+            ffn = _layernorm_fp8_linear(h, layer.final_layer_norm, layer.fc1)
+            h = residual + _gelu_fp8_linear(ffn, layer.activation_fn, layer.fc2)
 
         last_h = self.decoder.layer_norm(h[:, -1:, :])
         logits = self.proj_out(last_h).view(-1)
@@ -458,8 +664,7 @@ class _FastWhisperDecoder:
 
         for idx, layer in enumerate(self.decoder.layers):
             residual = h
-            normed = layer.self_attn_layer_norm(h)
-            q, k, v = self._project_self_qkv(layer.self_attn, normed, 1)
+            q, k, v = self._project_self_qkv_ln(layer.self_attn, layer.self_attn_layer_norm, h, 1)
             self._self_k[idx].index_copy_(2, self._pos_id, k)
             self._self_v[idx].index_copy_(2, self._pos_id, v)
             attn_out = F.scaled_dot_product_attention(
@@ -475,8 +680,7 @@ class _FastWhisperDecoder:
             h = residual + layer.self_attn.out_proj(attn_out)
 
             residual = h
-            normed = layer.encoder_attn_layer_norm(h)
-            cq = self._project_cross_q(layer.encoder_attn, normed, 1)
+            cq = self._project_cross_q_ln(layer.encoder_attn, layer.encoder_attn_layer_norm, h, 1)
             cross_out = F.scaled_dot_product_attention(
                 cq,
                 self._cross_k[idx],
@@ -489,8 +693,8 @@ class _FastWhisperDecoder:
             h = residual + layer.encoder_attn.out_proj(cross_out)
 
             residual = h
-            normed = layer.final_layer_norm(h)
-            h = residual + layer.fc2(layer.activation_fn(layer.fc1(normed)))
+            ffn = _layernorm_fp8_linear(h, layer.final_layer_norm, layer.fc1)
+            h = residual + _gelu_fp8_linear(ffn, layer.activation_fn, layer.fc2)
 
         h = self.decoder.layer_norm(h)
         logits = self.proj_out(h).view(-1)
