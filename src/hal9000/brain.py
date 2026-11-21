@@ -538,7 +538,7 @@ def list_llama_server_models(base_url: str) -> list[str]:
 DEFAULT_LIQUID_MODEL = "lfm3:1.7b"
 DEFAULT_SMART_MODEL = "gemma4:26b"
 DEFAULT_OLLAMA_NUM_CTX = 4096
-DEFAULT_REASONING_BUDGET = 64
+DEFAULT_REASONING_BUDGET = 48
 _HISTORY_EVICT_CHUNK = 4
 
 _NEEDS_TIME_RE = re.compile(

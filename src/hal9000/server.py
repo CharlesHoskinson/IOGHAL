@@ -1186,7 +1186,7 @@ def main() -> None:
         default=os.environ.get("HAL_THINKING_MODE", "auto"),
     )
     env_budget_raw = os.environ.get("HAL_REASONING_BUDGET", "")
-    default_reasoning_budget = int(env_budget_raw) if env_budget_raw.isdigit() else 64
+    default_reasoning_budget = int(env_budget_raw) if env_budget_raw.isdigit() else 48
     parser.add_argument(
         "--reasoning-budget",
         type=int,

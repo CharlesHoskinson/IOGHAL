@@ -122,7 +122,7 @@ class HalConfig:
     llm_backend: Literal["auto", "ollama", "llama_server"] = "auto"
     llama_server_url: str | None = None
     thinking_mode: Literal["auto", "off", "low"] = "auto"
-    reasoning_budget: int = 64
+    reasoning_budget: int = 48
     ref_wav: Path | None = None
     ref_text: str | None = None
     steps: int = 6

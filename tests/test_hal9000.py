@@ -1287,6 +1287,8 @@ class TestPipelineAndServer(unittest.TestCase):
         self.assertIn("ae-35", lore.lookup("What happened with the AE-35 unit?").lower())
         self.assertIn("chandra", lore.lookup("Who is Dr. Chandra and what happened on Discovery?").lower())
         self.assertIn("pico", lore.lookup("What happened to Halman in the Pico Vault?").lower())
+        self.assertEqual(brain.reasoning_budget, 48)
+        self.assertEqual(HalConfig().reasoning_budget, 48)
         brain.close()
 
 
