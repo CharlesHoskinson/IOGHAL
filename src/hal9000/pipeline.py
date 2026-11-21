@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 EventSink = Callable[[HalEvent], bool | None]
 _SENTENCE_QUEUE_MAX = 4
+_QUEUE_POLL_S = 0.01
+_LE_FLOAT32 = np.dtype("<f4")
 
 
 def _brain_accepts_param(brain: BrainProvider, name: str) -> bool:
@@ -60,6 +62,12 @@ class HalPipeline:
         self.tts = tts
         self.stt = stt
         self.gpu_lock = gpu_lock or threading.Lock()
+        self._brain_accepts_extra_context = _brain_accepts_extra_context(brain)
+        self._brain_can_defer_commit = (
+            _brain_accepts_param(brain, "auto_commit")
+            and callable(getattr(brain, "get_history_gen", None))
+            and callable(getattr(brain, "commit_turn", None))
+        )
 
     def run_turn(
         self,
@@ -128,7 +136,7 @@ class HalPipeline:
             web_context = ""
             if (
                 getattr(self.brain, "enable_web_search", False)
-                and _brain_accepts_extra_context(self.brain)
+                and self._brain_accepts_extra_context
                 and should_search_web(user_text)
             ):
                 emit("state", {"state": "thinking", "detail": "SEARCHING ARCHIVES..."})
@@ -166,11 +174,7 @@ class HalPipeline:
             gen_elapsed = 0.0
 
             # Quint Bug 4a fix: defer history commit until TTS actually speaks completed_sentences
-            defer_commit = (
-                _brain_accepts_param(self.brain, "auto_commit")
-                and callable(getattr(self.brain, "get_history_gen", None))
-                and callable(getattr(self.brain, "commit_turn", None))
-            )
+            defer_commit = self._brain_can_defer_commit
             turn_history_gen: int | None = (
                 self.brain.get_history_gen() if defer_commit else None  # type: ignore[attr-defined]
             )
@@ -181,7 +185,7 @@ class HalPipeline:
             def _put_with_cancel(item: tuple[str, object]) -> bool:
                 while not cancel_event.is_set():
                     try:
-                        sentence_q.put(item, timeout=0.05)
+                        sentence_q.put(item, timeout=_QUEUE_POLL_S)
                         return True
                     except queue.Full:
                         continue
@@ -190,7 +194,7 @@ class HalPipeline:
             def _llm_producer() -> None:
                 try:
                     kwargs: dict = {"stop_check": cancel_event.is_set}
-                    if web_context and _brain_accepts_extra_context(self.brain):
+                    if web_context and self._brain_accepts_extra_context:
                         kwargs["extra_context"] = web_context
                     if defer_commit:
                         kwargs["auto_commit"] = False
@@ -214,7 +218,7 @@ class HalPipeline:
                     result.cancelled = True
                     break
                 try:
-                    kind, payload = sentence_q.get(timeout=0.05)
+                    kind, payload = sentence_q.get(timeout=_QUEUE_POLL_S)
                 except queue.Empty:
                     if not producer_thread.is_alive():
                         break
@@ -255,7 +259,15 @@ class HalPipeline:
                             result.cancelled = True
                             sentence_completed = False
                             break
-                        arr = np.asarray(chunk, dtype="<f4").reshape(-1)
+                        if (
+                            isinstance(chunk, np.ndarray)
+                            and chunk.dtype == _LE_FLOAT32
+                            and chunk.ndim == 1
+                            and chunk.flags.c_contiguous
+                        ):
+                            arr = chunk
+                        else:
+                            arr = np.ascontiguousarray(chunk, dtype=_LE_FLOAT32).reshape(-1)
                         if arr.size == 0:
                             continue
                         if not audio_started:

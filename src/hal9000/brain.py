@@ -263,19 +263,19 @@ _FIRST_CLAUSE_COMMA_RE = re.compile(r",\s+")
 
 
 def split_first_clause(buffer: str) -> tuple[str | None, str]:
-    """Flush a long opening clause early so TTS begins before a long first sentence finishes."""
-    # Strong natural pause boundaries (; : — –) after >= 5 words
+    """Flush a substantial opening clause early so TTS begins before a long first sentence finishes."""
+    # Strong natural pause boundaries (; : — –) after >= 4 words
     for match in _FIRST_CLAUSE_STRONG_RE.finditer(buffer):
         prefix = buffer[: match.end()].strip()
         words = prefix.split()
-        if len(words) >= 5 and len(prefix) >= 24 and prefix.count('"') % 2 == 0:
+        if len(words) >= 4 and len(prefix) >= 20 and prefix.count('"') % 2 == 0:
             return prefix, buffer[match.end() :]
 
-    # Comma boundary only for genuinely long opening clauses (>= 9 words) to preserve smooth prosody
+    # Comma boundary for medium/long opening clauses (>= 6 words) — skips short greetings like "Good afternoon, Charles."
     for match in _FIRST_CLAUSE_COMMA_RE.finditer(buffer):
         prefix = buffer[: match.end()].strip()
         words = prefix.split()
-        if len(words) >= 9 and len(prefix) >= 45 and prefix.count('"') % 2 == 0:
+        if len(words) >= 6 and len(prefix) >= 34 and prefix.count('"') % 2 == 0:
             return prefix, buffer[match.end() :]
 
     return None, buffer

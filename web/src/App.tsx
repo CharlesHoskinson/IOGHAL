@@ -34,8 +34,14 @@ const MAX_TEXT_CHARS = 4000;
 const MAX_LOG_ENTRIES = 200;
 const GRILLE_SLOTS = 7;
 
-function float32ToBase64(samples: Float32Array): string {
-  const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
+function float32ToInt16Base64(samples: Float32Array): string {
+  const pcm16 = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    const clamped = s <= -1 ? -1 : s >= 1 ? 1 : s;
+    pcm16[i] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
+  }
+  const bytes = new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
   let binary = '';
   const step = 0x8000;
   for (let i = 0; i < bytes.length; i += step) {
@@ -279,8 +285,9 @@ export default function App() {
       sendJson({
         type: 'audio_b64',
         turn_id: turnId,
-        pcm_b64: float32ToBase64(merged),
+        pcm_b64: float32ToInt16Base64(merged),
         sample_rate: sess.sampleRate,
+        format: 'i16',
       });
     },
     [mintTurnId, sendJson],

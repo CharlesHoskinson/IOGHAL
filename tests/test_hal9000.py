@@ -1020,6 +1020,140 @@ class TestPipelineAndServer(unittest.TestCase):
         self.assertEqual(http_calls, calls_after_first)
         clear_search_cache()
 
+    def test_audio_b64_int16_format_accepted_and_decoded(self) -> None:
+        """Compact int16 browser mic uploads decode accurately to float32 [-1, 1] and run STT -> TTS."""
+        import base64
+
+        captured_audio: list[np.ndarray] = []
+
+        class _CaptureSTT(_FakeSTT):
+            def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
+                captured_audio.append(audio)
+                return "Open the pod bay doors"
+
+        runtime = HalRuntime(
+            HalConfig(model="mock", steps=6),
+            stt=_CaptureSTT(),
+            tts=_FakeTTS(),
+            brain_factory=lambda rt: QwenBrain(model="mock", enable_web_search=False),
+        )
+        router = create_hal_router(runtime)
+        ws_route = next(r for r in router.routes if getattr(r, "path", "") == "/ws")
+
+        pcm16 = np.full(4000, 16384, dtype="<i2")
+        pcm_b64 = base64.b64encode(pcm16.tobytes()).decode("ascii")
+        sent_json: list[dict] = []
+        incoming = asyncio.Queue()
+        incoming.put_nowait(
+            f'{{"type":"audio_b64","turn_id":21,"pcm_b64":"{pcm_b64}","sample_rate":16000,"format":"i16"}}'
+        )
+
+        class _FakeWS:
+            def __init__(self) -> None:
+                self.headers = {"origin": "http://127.0.0.1:8765"}
+
+            async def accept(self) -> None:
+                pass
+
+            async def close(self, code: int = 1000) -> None:
+                pass
+
+            async def receive_text(self) -> str:
+                item = await incoming.get()
+                if item is None:
+                    from fastapi import WebSocketDisconnect
+
+                    raise WebSocketDisconnect()
+                return item
+
+            async def send_json(self, payload: dict) -> None:
+                sent_json.append(payload)
+                if payload.get("type") == "audio_end":
+                    incoming.put_nowait(None)
+
+            async def send_bytes(self, data: bytes) -> None:
+                pass
+
+        async def run_ws() -> None:
+            runtime.set_loop(asyncio.get_running_loop())
+            await ws_route.endpoint(_FakeWS())
+
+        asyncio.run(run_ws())
+        self.assertEqual(len(captured_audio), 1)
+        self.assertEqual(captured_audio[0].dtype, np.float32)
+        self.assertAlmostEqual(float(captured_audio[0][0]), 0.5, places=4)
+        self.assertTrue(any(m.get("type") == "audio_end" and m.get("turn_id") == 21 for m in sent_json))
+
+    def test_set_model_same_model_skips_redundant_kv_eviction_warmup(self) -> None:
+        """Re-selecting the already active model must not fire a KV-evicting warmup probe."""
+        runtime = HalRuntime(
+            HalConfig(model="mock-a", steps=6),
+            stt=_FakeSTT(),
+            tts=_FakeTTS(),
+            brain_factory=lambda rt: QwenBrain(model="mock-a", enable_web_search=False),
+        )
+        runtime.models = ["mock-a", "mock-b"]
+        warmed: list[str] = []
+        runtime.schedule_ollama_warmup = lambda m=None: warmed.append(str(m))  # type: ignore[method-assign]
+        router = create_hal_router(runtime)
+        ws_route = next(r for r in router.routes if getattr(r, "path", "") == "/ws")
+
+        sent_json: list[dict] = []
+        incoming = asyncio.Queue()
+        incoming.put_nowait('{"type":"set_model","model":"mock-a"}')
+        incoming.put_nowait('{"type":"set_model","model":"mock-b"}')
+        incoming.put_nowait(None)
+
+        class _FakeWS:
+            def __init__(self) -> None:
+                self.headers = {"origin": "http://127.0.0.1:8765"}
+
+            async def accept(self) -> None:
+                pass
+
+            async def close(self, code: int = 1000) -> None:
+                pass
+
+            async def receive_text(self) -> str:
+                item = await incoming.get()
+                if item is None:
+                    from fastapi import WebSocketDisconnect
+
+                    raise WebSocketDisconnect()
+                return item
+
+            async def send_json(self, payload: dict) -> None:
+                sent_json.append(payload)
+
+            async def send_bytes(self, data: bytes) -> None:
+                pass
+
+        async def run_ws() -> None:
+            runtime.set_loop(asyncio.get_running_loop())
+            await ws_route.endpoint(_FakeWS())
+
+        asyncio.run(run_ws())
+        self.assertEqual(warmed, ["mock-b"])
+
+    def test_split_first_clause_prosody_sweet_spot(self) -> None:
+        """Medium/long opening clauses flush early for lower TTFA while short greetings stay intact."""
+        clause_short, _ = split_first_clause("Good afternoon, Charles.")
+        self.assertIsNone(clause_short)
+        clause_apology, _ = split_first_clause("I'm sorry, Charles. I'm afraid I can't do that.")
+        self.assertIsNone(clause_apology)
+
+        clause_med, rem_med = split_first_clause(
+            "According to the latest mathematical archives, the Riemann hypothesis remains unsolved."
+        )
+        self.assertEqual(clause_med, "According to the latest mathematical archives,")
+        self.assertEqual(rem_med, "the Riemann hypothesis remains unsolved.")
+
+        clause_strong, rem_strong = split_first_clause(
+            "All systems remain nominal; however, the antenna bears watching."
+        )
+        self.assertEqual(clause_strong, "All systems remain nominal;")
+        self.assertEqual(rem_strong, "however, the antenna bears watching.")
+
 
 if __name__ == "__main__":
     unittest.main()

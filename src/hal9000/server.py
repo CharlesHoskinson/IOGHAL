@@ -58,6 +58,7 @@ MAX_SAMPLE_RATE = 96000
 MAX_UPLOAD_DURATION_S = 30.0
 MIN_AUDIO_DURATION_S = 0.2
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_LE_FLOAT32 = np.dtype("<f4")
 
 
 def is_allowed_origin(
@@ -445,6 +446,19 @@ class HalRuntime:
         ).start()
 
     def _warmup_tts_async(self) -> None:
+        if self._shutdown_event.is_set():
+            return
+        # Warm STT first (runs first in a live voice turn) and yield gpu_lock between STT and TTS
+        # so an immediate user utterance after boot is never stalled behind both warmups.
+        if isinstance(self.stt, WhisperSTT) and self.gpu_lock.acquire(blocking=False):
+            try:
+                if not self._shutdown_event.is_set():
+                    self.stt.warmup()
+            except (RuntimeError, ValueError, OSError) as exc:
+                logger.debug("Background STT warmup skipped: %s", exc)
+            finally:
+                self.gpu_lock.release()
+
         if self._shutdown_event.is_set() or self.tts is None:
             return
         if not self.gpu_lock.acquire(blocking=False):
@@ -454,10 +468,8 @@ class HalRuntime:
                 self.tts.warmup_streaming(seed=42, max_chunks=1)
             else:
                 _ = self.tts.synthesize("Yes.", seed=42)
-            if not self._shutdown_event.is_set() and isinstance(self.stt, WhisperSTT):
-                self.stt.warmup()
         except (RuntimeError, ValueError, OSError) as exc:
-            logger.debug("Background GPU warmup skipped: %s", exc)
+            logger.debug("Background TTS warmup skipped: %s", exc)
         finally:
             self.gpu_lock.release()
 
@@ -642,7 +654,9 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
             """Non-blocking PCM handoff so a slow client never stalls runtime.gpu_lock."""
             if ws_closed.is_set() or loop.is_closed():
                 return False
-            framed = struct.pack("<I", turn_id) + np.asarray(pcm, dtype="<f4").tobytes()
+            if not (pcm.dtype == _LE_FLOAT32 and pcm.flags.c_contiguous):
+                pcm = np.ascontiguousarray(pcm, dtype=_LE_FLOAT32)
+            framed = b"".join((struct.pack("<I", turn_id), memoryview(pcm).cast("B")))
             loop.call_soon_threadsafe(enqueue_on_loop, "bytes", framed, item_gen)
             return not ws_closed.is_set()
 
@@ -924,6 +938,10 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                         await stop_local_mic_async()
                     pcm_b64 = msg.get("pcm_b64")
                     sr = msg.get("sample_rate", 16000)
+                    fmt = msg.get("format", "f32")
+                    if fmt not in ("f32", "i16"):
+                        reject_turn(client_tid, "Unsupported audio format.")
+                        continue
                     if (
                         not isinstance(pcm_b64, str)
                         or not pcm_b64
@@ -943,10 +961,18 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                     except (binascii.Error, ValueError):
                         reject_turn(client_tid, "Malformed base64 audio.")
                         continue
-                    if len(pcm_bytes) % 4 != 0:
-                        reject_turn(client_tid, "Unaligned float32 audio.")
-                        continue
-                    audio = np.frombuffer(pcm_bytes, dtype="<f4").copy()
+                    if fmt == "i16":
+                        if len(pcm_bytes) % 2 != 0:
+                            reject_turn(client_tid, "Unaligned int16 audio.")
+                            continue
+                        audio = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.float32) * (
+                            1.0 / 32768.0
+                        )
+                    else:
+                        if len(pcm_bytes) % 4 != 0:
+                            reject_turn(client_tid, "Unaligned float32 audio.")
+                            continue
+                        audio = np.frombuffer(pcm_bytes, dtype="<f4").copy()
                     dur_s = audio.size / float(sr)
                     if dur_s < MIN_AUDIO_DURATION_S:
                         enqueue_on_loop(
@@ -962,7 +988,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                     if dur_s > MAX_UPLOAD_DURATION_S:
                         reject_turn(client_tid, f"Audio exceeds {int(MAX_UPLOAD_DURATION_S)}s limit.")
                         continue
-                    if not np.all(np.isfinite(audio)):
+                    if fmt == "f32" and not np.all(np.isfinite(audio)):
                         reject_turn(client_tid, "Non-finite audio samples.")
                         continue
 
@@ -1040,8 +1066,12 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                 elif mtype == "set_model":
                     new_model = msg.get("model")
                     if isinstance(new_model, str) and new_model in runtime.models:
-                        brain.set_model(new_model)
-                        runtime.schedule_ollama_warmup(new_model)
+                        prev_model = (
+                            brain.get_model() if hasattr(brain, "get_model") else brain.model
+                        )
+                        if new_model != prev_model:
+                            brain.set_model(new_model)
+                            runtime.schedule_ollama_warmup(new_model)
                         enqueue_on_loop(
                             "json", runtime.status_payload(model=brain.model, steps=conn_steps)
                         )
