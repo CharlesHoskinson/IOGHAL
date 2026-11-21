@@ -44,7 +44,7 @@ DEFAULT_REF_WAV = DEFAULT_PROJECT_DIR / "voices" / "hal9000_ref.wav"
 DEFAULT_REF_TXT = DEFAULT_PROJECT_DIR / "voices" / "hal9000_ref.txt"
 DEFAULT_LORA_DIR = DEFAULT_PROJECT_DIR / "voices" / "hal9000_lora"
 MIN_DIFFUSION_STEPS = 2
-_FAST_KV_MAX_LEN = 1024
+_FAST_KV_MAX_LEN = 512
 
 # Preserve backward compatibility for scripts importing _FP8Linear from hal9000.tts
 _FP8Linear = FP8Linear
@@ -237,6 +237,7 @@ def _fuse_minicpm_model(
                 kv_cache,
                 norm_weight=None,
                 norm_eps=1e-6,
+                attn_mask=None,
                 _arange=arange_buf,
             ):
                 bsz, _ = hidden_states.size()
@@ -254,9 +255,9 @@ def _fuse_minicpm_model(
                 key_cache, value_cache = kv_cache
                 key_cache[:, :, position_id, :] = k
                 value_cache[:, :, position_id, :] = v
-                attn_mask = (_arange <= position_id).view(1, 1, 1, -1)
+                mask = (_arange <= position_id).view(1, 1, 1, -1) if attn_mask is None else attn_mask
                 attn_out = F.scaled_dot_product_attention(
-                    q, key_cache, value_cache, attn_mask=attn_mask, enable_gqa=True
+                    q, key_cache, value_cache, attn_mask=mask, enable_gqa=True
                 )
                 attn_out = attn_out.transpose(1, 2).reshape(bsz, self._q_dim)
                 return self.o_proj(attn_out)
@@ -350,6 +351,7 @@ def _fuse_minicpm_model(
                     position_emb,
                     position_id,
                     kv_cache,
+                    attn_mask=None,
                     _mup=mup_scale,
                     _in_eps=in_eps,
                     _post_eps=post_eps,
@@ -365,6 +367,7 @@ def _fuse_minicpm_model(
                             kv_cache,
                             norm_weight=self.input_layernorm.weight,
                             norm_eps=_in_eps,
+                            attn_mask=attn_mask,
                         )
                     else:
                         attn_out = self.self_attn.forward_step(
@@ -372,6 +375,7 @@ def _fuse_minicpm_model(
                             position_emb,
                             position_id,
                             kv_cache,
+                            attn_mask=attn_mask,
                         )
                     hidden_states = residual + (attn_out * _mup if _mup is not None else attn_out)
 
@@ -386,6 +390,30 @@ def _fuse_minicpm_model(
                     return hidden_states
 
                 layer.forward_step = types.MethodType(fused_layer_step, layer)
+
+    if arange_buf is not None:
+        def fused_model_forward_step(
+            self,
+            inputs_embeds: torch.Tensor,
+            position_id: torch.Tensor,
+            attn_mask: torch.Tensor | None = None,
+            _arange=arange_buf,
+        ) -> torch.Tensor:
+            assert self.kv_cache is not None, "KV cache is not setup"
+            position_emb = self.rope_emb(position_id) if self.rope_emb is not None else None
+            mask = (_arange <= position_id).view(1, 1, 1, -1) if attn_mask is None else attn_mask
+            hidden_states = inputs_embeds
+            for i, decoder_layer in enumerate(self.layers):
+                hidden_states = decoder_layer.forward_step(
+                    hidden_states,
+                    position_emb,
+                    position_id,
+                    self.kv_cache.get_layer_cache(i),
+                    mask,
+                )
+            return self.norm(hidden_states)
+
+        model.forward_step = types.MethodType(fused_model_forward_step, model)
 
 
 class _FastAudioVAEGraph:
@@ -414,7 +442,7 @@ class _FastAudioVAEGraph:
             Snake1d,
         )
 
-        from ._cuda_ops import snake1d_fp32
+        from ._cuda_ops import snake1d_fp32, sr_cond_snake1d_fp32
 
         sr_idx = (
             self.vae.decoder.get_sr_idx(self._sr_cond)
@@ -422,7 +450,54 @@ class _FastAudioVAEGraph:
             else None
         )
 
+        # Fuse SampleRateConditionLayer (scale/bias) directly into the immediately following Snake1d (exact FP32)
+        fused_sr_mods: set[int] = set()
+        if (
+            TRITON_AVAILABLE
+            and self.dtype == torch.float32
+            and sr_idx is not None
+            and hasattr(self.vae.decoder, "sr_cond_model")
+        ):
+            for layer, sr_mod in zip(self.vae.decoder.model, self.vae.decoder.sr_cond_model):
+                if (
+                    sr_mod is not None
+                    and isinstance(sr_mod, SampleRateConditionLayer)
+                    and sr_mod.cond_type in ("scale_bias", "scale_bias_init")
+                    and isinstance(sr_mod.out_layer, nn.Identity)
+                    and hasattr(layer, "block")
+                    and len(layer.block) > 0
+                    and isinstance(layer.block[0], Snake1d)
+                ):
+                    snake_mod = layer.block[0]
+                    orig_sr = sr_mod.forward
+                    orig_snake = snake_mod.forward
+                    with torch.no_grad():
+                        scale_1d = sr_mod.scale_embed(sr_idx).reshape(-1).to(device=self.device, dtype=torch.float32).contiguous()
+                        bias_1d = sr_mod.bias_embed(sr_idx).reshape(-1).to(device=self.device, dtype=torch.float32).contiguous()
+                    alpha_1d = snake_mod.alpha.detach().reshape(-1).to(device=self.device, dtype=torch.float32).contiguous()
+                    inv_alpha_1d = (alpha_1d + 1e-9).reciprocal().contiguous()
+                    self._keepalive.extend((scale_1d, bias_1d, alpha_1d, inv_alpha_1d))
+
+                    def _make_sr_noop():
+                        def fwd(x, _sr_cond=None):
+                            return x
+                        return fwd
+
+                    def _make_sr_snake(_s, _b, _a, _ia):
+                        def fwd(x):
+                            return sr_cond_snake1d_fp32(x, _s, _b, _a, _ia)
+                        return fwd
+
+                    sr_mod.forward = _make_sr_noop()
+                    snake_mod.forward = _make_sr_snake(scale_1d, bias_1d, alpha_1d, inv_alpha_1d)
+                    self._originals.append((sr_mod, orig_sr))
+                    self._originals.append((snake_mod, orig_snake))
+                    fused_sr_mods.add(id(sr_mod))
+                    fused_sr_mods.add(id(snake_mod))
+
         for mod in self.vae.decoder.modules():
+            if id(mod) in fused_sr_mods:
+                continue
             if isinstance(mod, CausalConv1d):
                 pad = mod._CausalConv1d__padding * 2 - mod._CausalConv1d__output_padding
                 if pad > 0:
@@ -651,6 +726,7 @@ class _MegaStepRunner:
             dit_proj_b = None
 
         dt_zeros = torch.zeros((2,), device=device, dtype=dtype)
+        kv_arange = getattr(m, "_kv_arange", None)
         schedule_steps: list[tuple[torch.Tensor, torch.Tensor, bool]] = []
         t_cur = t_span[0]
         dt_cur = t_span[0] - t_span[1]
@@ -763,10 +839,17 @@ class _MegaStepRunner:
             else:
                 curr_embed = m.enc_to_lm_proj(feat_enc(prefix_cond.unsqueeze(1)))[:, 0, :]
 
-            next_lm = base_step(curr_embed, pos_id)
-            next_lm = m.fsq_layer(next_lm)
-            curr_res_in = m.fusion_concat_proj(torch.cat((next_lm, curr_embed), dim=-1))
-            next_res = res_step(curr_res_in, pos_id)
+            if kv_arange is not None:
+                step_attn_mask = (kv_arange <= pos_id).view(1, 1, 1, -1)
+                next_lm = base_step(curr_embed, pos_id, step_attn_mask)
+                next_lm = m.fsq_layer(next_lm)
+                curr_res_in = m.fusion_concat_proj(torch.cat((next_lm, curr_embed), dim=-1))
+                next_res = res_step(curr_res_in, pos_id, step_attn_mask)
+            else:
+                next_lm = base_step(curr_embed, pos_id)
+                next_lm = m.fsq_layer(next_lm)
+                curr_res_in = m.fusion_concat_proj(torch.cat((next_lm, curr_embed), dim=-1))
+                next_res = res_step(curr_res_in, pos_id)
 
             # Compute next step's stop decision immediately from next_lm so step i+1 knows whether to skip lm_fn!
             next_stop_flag = m.stop_head(m.stop_actn(m.stop_proj(next_lm))).argmax(dim=-1)[0]
@@ -1016,6 +1099,11 @@ class _MegaStepRunner:
         # Capture/fetch Mega-Step CUDA graph BEFORE fill_caches so warmup never overwrites live KV!
         g = self._get_or_capture_graph(inference_timesteps, cfg_value)
 
+        # Reset AudioVAE rolling state asynchronously on vae_stream overlapped with prefill + dit_0
+        vae_stream = self._vae_stream
+        with torch.cuda.stream(vae_stream):
+            self._vae_graph.reset()
+
         # Fast incremental prefill path for ref_continuation (bit-identical causal KV prefix reuse;
         # skips building unused full CPU/GPU prompt tensors when the static prefix snapshot hits)
         used_prefix_cache = False
@@ -1161,7 +1249,6 @@ class _MegaStepRunner:
         g["res_hidden"].copy_(init_res)
         g["prefix_cond"].copy_(last_audio_cond)
         g["pos_id"].fill_(prefill_len)
-        self._vae_graph.reset()
 
         # Pre-sample all diffusion noise for this sentence in 1 kernel call (reproducible with seed!)
         all_noise = torch.randn((eff_max_len, 1, m.feat_dim, m.patch_size), device=device, dtype=dtype)
@@ -1177,7 +1264,6 @@ class _MegaStepRunner:
         )
 
         main_stream = torch.cuda.current_stream()
-        vae_stream = self._vae_stream
         vae_slot_active = [False, False]
         pending_slot: int | None = None
 
@@ -1302,6 +1388,7 @@ def _accelerate_voxcpm2_cuda(tts_model, *, use_int4_lm: bool = False) -> None:
         tts_model.base_lm.setup_cache(1, max_kv, tts_model.device, lm_dtype)
         tts_model.residual_lm.setup_cache(1, max_kv, tts_model.device, lm_dtype)
         arange_buf = torch.arange(max_kv, device=tts_model.device)
+        tts_model._kv_arange = arange_buf
 
         # 2. Fuse QKV + Gate/Up on base_lm & residual_lm (FP8 backbone, pure BF16 continuous acoustic DiT/encoder)
         _fuse_minicpm_model(tts_model.base_lm, use_int4=use_int4_lm, arange_buf=arange_buf)
