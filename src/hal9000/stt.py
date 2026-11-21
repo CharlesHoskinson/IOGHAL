@@ -17,7 +17,12 @@ from transformers.cache_utils import EncoderDecoderCache
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import BaseModelOutput
 
-from ._cuda_ops import FP8Linear, capture_cuda_graph, probe_fp8_supported
+from ._cuda_ops import (
+    CUDA_GRAPH_LOCK,
+    FP8Linear,
+    capture_cuda_graph,
+    probe_fp8_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +278,282 @@ def _quantize_whisper_fp8(model: nn.Module) -> int:
     return count
 
 
+class _FastWhisperDecoder:
+    """Static-KV-cache + CUDA-graphed greedy Whisper decoder (cross-KV+prefill graph + 1-token step graph)."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        prefix_ids: torch.Tensor,
+        *,
+        device: str,
+        dtype: torch.dtype,
+        max_new_tokens: int = 160,
+        suppress_tokens: list[int] | tuple[int, ...] | None = None,
+        begin_suppress_tokens: list[int] | tuple[int, ...] | None = None,
+    ) -> None:
+        inner = getattr(model, "model", model)
+        self.decoder = inner.decoder
+        self.proj_out = model.proj_out
+        cfg = model.config
+        gen_cfg = model.generation_config
+
+        self.device = device
+        self.dtype = dtype
+        self.num_layers = len(self.decoder.layers)
+        self.num_heads = int(cfg.decoder_attention_heads)
+        self.embed_dim = int(cfg.d_model)
+        self.head_dim = self.embed_dim // self.num_heads
+        self.src_len = int(cfg.max_source_positions)
+        self.vocab_size = int(cfg.vocab_size)
+        self.max_target_positions = int(cfg.max_target_positions)
+
+        eos_raw = getattr(gen_cfg, "eos_token_id", getattr(cfg, "eos_token_id", 50257))
+        if isinstance(eos_raw, (list, tuple)):
+            eos_raw = eos_raw[0]
+        self.eos_token_id = int(eos_raw)
+
+        self._static_prefix_ids = prefix_ids.to(device=device, dtype=torch.long).contiguous()
+        self.prefix_len = int(self._static_prefix_ids.shape[1])
+        self._static_prefix_pos = (
+            self.decoder.embed_positions.weight[: self.prefix_len]
+            .unsqueeze(0)
+            .to(device=device, dtype=dtype)
+            .contiguous()
+        )
+
+        # Align static self-attention KV cache length to 64 (within max_target_positions)
+        aligned_len = ((self.prefix_len + int(max_new_tokens) + 63) // 64) * 64
+        self.max_cache_len = min(self.max_target_positions, max(self.prefix_len + 1, aligned_len))
+
+        self._suppress_mask = self._build_token_mask(suppress_tokens)
+        self._begin_suppress_mask = self._build_token_mask(begin_suppress_tokens)
+
+        # Pre-allocated static buffers owned for CUDA graph lifetime
+        self._static_enc_hidden = torch.zeros(
+            (1, self.src_len, self.embed_dim), device=device, dtype=dtype
+        )
+        self._self_k = [
+            torch.zeros((1, self.num_heads, self.max_cache_len, self.head_dim), device=device, dtype=dtype)
+            for _ in range(self.num_layers)
+        ]
+        self._self_v = [
+            torch.zeros((1, self.num_heads, self.max_cache_len, self.head_dim), device=device, dtype=dtype)
+            for _ in range(self.num_layers)
+        ]
+        self._cross_k = [
+            torch.zeros((1, self.num_heads, self.src_len, self.head_dim), device=device, dtype=dtype)
+            for _ in range(self.num_layers)
+        ]
+        self._cross_v = [
+            torch.zeros((1, self.num_heads, self.src_len, self.head_dim), device=device, dtype=dtype)
+            for _ in range(self.num_layers)
+        ]
+        self._arange = torch.arange(self.max_cache_len, device=device, dtype=torch.long)
+        self._cur_token = torch.zeros((1, 1), device=device, dtype=torch.long)
+        self._pos_id = torch.zeros((1,), device=device, dtype=torch.long)
+        self._out_token = torch.zeros((), device=device, dtype=torch.long)
+
+        self._prefill_graph: torch.cuda.CUDAGraph | None = None
+        self._step_graph: torch.cuda.CUDAGraph | None = None
+        self._capture_graphs()
+
+    def _build_token_mask(self, token_ids: list[int] | tuple[int, ...] | None) -> torch.Tensor | None:
+        if not token_ids:
+            return None
+        mask = torch.zeros(self.vocab_size, device=self.device, dtype=torch.bool)
+        valid = [int(t) for t in token_ids if 0 <= int(t) < self.vocab_size]
+        if not valid:
+            return None
+        mask[torch.tensor(valid, device=self.device, dtype=torch.long)] = True
+        return mask
+
+    def _project_self_qkv(
+        self, attn: nn.Module, h: torch.Tensor, seq_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hasattr(attn, "qkv_proj"):
+            q, k, v = attn.qkv_proj(h).chunk(3, dim=-1)
+            if not getattr(attn, "_q_scaled", False):
+                q = q * attn.scaling
+        else:
+            q = attn.q_proj(h)
+            if not getattr(attn, "_q_scaled", False):
+                q = q * attn.scaling
+            k = attn.k_proj(h)
+            v = attn.v_proj(h)
+        q = q.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        return q, k, v
+
+    def _project_cross_kv(
+        self, enc_attn: nn.Module, enc_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(enc_attn, "kv_proj"):
+            k, v = enc_attn.kv_proj(enc_hidden).chunk(2, dim=-1)
+        else:
+            k = enc_attn.k_proj(enc_hidden)
+            v = enc_attn.v_proj(enc_hidden)
+        k = k.view(1, self.src_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(1, self.src_len, self.num_heads, self.head_dim).transpose(1, 2)
+        return k, v
+
+    def _project_cross_q(self, enc_attn: nn.Module, h: torch.Tensor, seq_len: int) -> torch.Tensor:
+        q = enc_attn.q_proj(h)
+        if not getattr(enc_attn, "_q_scaled", False):
+            q = q * enc_attn.scaling
+        return q.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _prefill_fn(self) -> None:
+        h = self.decoder.embed_tokens(self._static_prefix_ids) + self._static_prefix_pos
+        p_len = self.prefix_len
+        for idx, layer in enumerate(self.decoder.layers):
+            residual = h
+            normed = layer.self_attn_layer_norm(h)
+            q, k, v = self._project_self_qkv(layer.self_attn, normed, p_len)
+            self._self_k[idx][:, :, :p_len, :].copy_(k)
+            self._self_v[idx][:, :, :p_len, :].copy_(v)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=True, scale=1.0
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().view(1, p_len, self.embed_dim)
+            h = residual + layer.self_attn.out_proj(attn_out)
+
+            residual = h
+            normed = layer.encoder_attn_layer_norm(h)
+            ck, cv = self._project_cross_kv(layer.encoder_attn, self._static_enc_hidden)
+            self._cross_k[idx].copy_(ck)
+            self._cross_v[idx].copy_(cv)
+            cq = self._project_cross_q(layer.encoder_attn, normed, p_len)
+            cross_out = F.scaled_dot_product_attention(
+                cq,
+                self._cross_k[idx],
+                self._cross_v[idx],
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0,
+            )
+            cross_out = cross_out.transpose(1, 2).contiguous().view(1, p_len, self.embed_dim)
+            h = residual + layer.encoder_attn.out_proj(cross_out)
+
+            residual = h
+            normed = layer.final_layer_norm(h)
+            h = residual + layer.fc2(layer.activation_fn(layer.fc1(normed)))
+
+        last_h = self.decoder.layer_norm(h[:, -1:, :])
+        logits = self.proj_out(last_h).view(-1)
+        if self._suppress_mask is not None:
+            logits = logits.masked_fill(self._suppress_mask, float("-inf"))
+        if self._begin_suppress_mask is not None:
+            logits = logits.masked_fill(self._begin_suppress_mask, float("-inf"))
+        first_tok = logits.argmax(dim=-1)
+        self._cur_token.copy_(first_tok.view(1, 1))
+        self._out_token.copy_(first_tok)
+        self._pos_id.fill_(p_len)
+
+    def _step_fn(self) -> None:
+        pos_embed = F.embedding(self._pos_id, self.decoder.embed_positions.weight).unsqueeze(0)
+        h = self.decoder.embed_tokens(self._cur_token) + pos_embed
+        attn_mask = (self._arange <= self._pos_id).view(1, 1, 1, -1)
+
+        for idx, layer in enumerate(self.decoder.layers):
+            residual = h
+            normed = layer.self_attn_layer_norm(h)
+            q, k, v = self._project_self_qkv(layer.self_attn, normed, 1)
+            self._self_k[idx].index_copy_(2, self._pos_id, k)
+            self._self_v[idx].index_copy_(2, self._pos_id, v)
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                self._self_k[idx],
+                self._self_v[idx],
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0,
+            )
+            attn_out = attn_out.transpose(1, 2).reshape(1, 1, self.embed_dim)
+            h = residual + layer.self_attn.out_proj(attn_out)
+
+            residual = h
+            normed = layer.encoder_attn_layer_norm(h)
+            cq = self._project_cross_q(layer.encoder_attn, normed, 1)
+            cross_out = F.scaled_dot_product_attention(
+                cq,
+                self._cross_k[idx],
+                self._cross_v[idx],
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0,
+            )
+            cross_out = cross_out.transpose(1, 2).reshape(1, 1, self.embed_dim)
+            h = residual + layer.encoder_attn.out_proj(cross_out)
+
+            residual = h
+            normed = layer.final_layer_norm(h)
+            h = residual + layer.fc2(layer.activation_fn(layer.fc1(normed)))
+
+        h = self.decoder.layer_norm(h)
+        logits = self.proj_out(h).view(-1)
+        if self._suppress_mask is not None:
+            logits = logits.masked_fill(self._suppress_mask, float("-inf"))
+        next_tok = logits.argmax(dim=-1)
+        self._cur_token.copy_(next_tok.view(1, 1))
+        self._out_token.copy_(next_tok)
+        self._pos_id.add_(1)
+
+    def _capture_graphs(self) -> None:
+        with CUDA_GRAPH_LOCK:
+            torch.cuda.synchronize()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.inference_mode(), torch.cuda.stream(stream):
+                for _ in range(3):
+                    self._prefill_fn()
+                for _ in range(3):
+                    self._pos_id.fill_(self.prefix_len)
+                    self._step_fn()
+            torch.cuda.current_stream().wait_stream(stream)
+
+            prefill_graph = torch.cuda.CUDAGraph()
+            with torch.inference_mode(), torch.cuda.graph(prefill_graph):
+                self._prefill_fn()
+
+            self._pos_id.fill_(self.prefix_len)
+            step_graph = torch.cuda.CUDAGraph()
+            with torch.inference_mode(), torch.cuda.graph(step_graph):
+                self._step_fn()
+
+            torch.cuda.synchronize()
+
+        self._prefill_graph = prefill_graph
+        self._step_graph = step_graph
+        for k_buf, v_buf in zip(self._self_k, self._self_v, strict=True):
+            k_buf.zero_()
+            v_buf.zero_()
+
+    @torch.inference_mode()
+    def decode(self, encoder_hidden_states: torch.Tensor, max_new_tokens: int = 160) -> list[int]:
+        assert self._prefill_graph is not None and self._step_graph is not None
+        max_steps = min(int(max_new_tokens), self.max_cache_len - self.prefix_len)
+        if max_steps <= 0:
+            return []
+
+        self._static_enc_hidden.copy_(encoder_hidden_states)
+        self._prefill_graph.replay()
+        tok = int(self._out_token.item())
+        if tok == self.eos_token_id:
+            return []
+
+        tokens = [tok]
+        for _ in range(max_steps - 1):
+            self._step_graph.replay()
+            tok = int(self._out_token.item())
+            if tok == self.eos_token_id:
+                break
+            tokens.append(tok)
+        return tokens
+
+
 class WhisperSTT:
     """Fast local-first CUDA Whisper transcriber with native FP8 & greedy decoding."""
 
@@ -346,6 +627,8 @@ class WhisperSTT:
 
         self.fp8_enabled = False
         self.encoder_graphed = False
+        self.decoder_graphed = False
+        self._fast_decoder: _FastWhisperDecoder | None = None
         if self.dtype == torch.bfloat16 and probe_fp8_supported(self.device):
             try:
                 inner = getattr(self.model, "model", self.model)
@@ -384,12 +667,29 @@ class WhisperSTT:
             except (RuntimeError, ValueError, TypeError, AttributeError, OSError) as exc:
                 logger.debug("Whisper FP8/CUDA-graph acceleration skipped: %s", exc)
 
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            try:
+                self._fast_decoder = _FastWhisperDecoder(
+                    self.model,
+                    self._decoder_prefix_ids,
+                    device=self.device,
+                    dtype=self.dtype,
+                    max_new_tokens=160,
+                    suppress_tokens=getattr(gen_cfg, "suppress_tokens", None),
+                    begin_suppress_tokens=getattr(gen_cfg, "begin_suppress_tokens", None),
+                )
+                self.decoder_graphed = True
+            except (RuntimeError, ValueError, TypeError, AttributeError, OSError) as exc:
+                logger.debug("Whisper CUDA-graph decoder skipped: %s", exc)
+                self._fast_decoder = None
+
         logger.info(
-            "Loaded Whisper STT (%s) on %s (%s%s) in %.2fs",
+            "Loaded Whisper STT (%s) on %s (%s%s%s) in %.2fs",
             model_id,
             self.device,
             self.dtype,
             " + FP8" if self.fp8_enabled else "",
+            " + CG-Decoder" if self.decoder_graphed else "",
             time.perf_counter() - t0,
         )
 
@@ -470,7 +770,13 @@ class WhisperSTT:
         return log_spec.to(dtype=self.dtype)
 
     def _generate_greedy(self, input_features: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
-        """Run single-pass greedy decoding directly via GenerationMixin (no deprecation warnings)."""
+        """Run fast CUDA-graphed greedy decoding with clean GenerationMixin fallback."""
+        if self._fast_decoder is not None:
+            inner = getattr(self.model, "model", self.model)
+            enc_hidden = inner.encoder(input_features).last_hidden_state
+            tokens = self._fast_decoder.decode(enc_hidden, max_new_tokens=max_new_tokens)
+            return torch.tensor([tokens], dtype=torch.long)
+
         prefix_ids = self._decoder_prefix_ids
         gen_cfg = self._make_greedy_gen_config(max_new_tokens)
         sequences = GenerationMixin.generate(
