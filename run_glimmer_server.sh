@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Launch Meta Muse-Glimmer-30B + DFlash-15 via Ollama's bundled CUDA 13 llama-server
-# inside heavy.slice (drops 1.40 GB vision mmproj, avoids 16 GiB ollama.service cap,
-# uses glimmer_hal_v2.jinja for per-request Zero-Think vs Low-Think with 100% KV reuse).
+# Launch Meta Muse-Glimmer-30B + DFlash-15 via native Blackwell sm_121a llama-server
+# (falling back to Ollama's bundled CUDA 13 binary) inside heavy.slice: drops 1.40 GB
+# vision mmproj, avoids 16 GiB ollama.service cap, and uses glimmer_hal_v2.jinja for
+# per-request Zero-Think vs Low-Think with 100% KV reuse.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+NATIVE_BIN="${HAL_LLAMA_NATIVE_BIN:-$HOME/.local/opt/llama-cpp-blackwell/build/bin/llama-server}"
+SYSTEM_CUDA_LIB="${HAL_CUDA_LIB:-/opt/cuda/lib64}"
 OLLAMA_LIB="${OLLAMA_LIB:-$HOME/.local/opt/ollama/lib/ollama}"
 CUDA_DIR="${OLLAMA_CUDA_DIR:-$OLLAMA_LIB/cuda_v13}"
 BLOBS_DIR="${OLLAMA_BLOBS_DIR:-$HOME/.local/share/ollama/models/blobs}"
@@ -14,11 +17,35 @@ DRAFT_BLOB="${HAL_GLIMMER_DRAFT:-$BLOBS_DIR/sha256-27d9a805fa29b943cfb6ad4843367
 TEMPLATE_FILE="${HAL_GLIMMER_TEMPLATE:-$ROOT/templates/glimmer_hal_v2.jinja}"
 PORT="${HAL_LLAMA_PORT:-8080}"
 DRAFT_N_MAX="${HAL_DRAFT_N_MAX:-15}"
+CACHE_TYPE_K="${HAL_CACHE_TYPE_K:-f16}"
+CACHE_TYPE_V="${HAL_CACHE_TYPE_V:-f16}"
+BATCH_SIZE="${HAL_BATCH_SIZE:-512}"
+UBATCH_SIZE="${HAL_UBATCH_SIZE:-512}"
 REASONING_BUDGET="${HAL_REASONING_BUDGET:-64}"
+REASONING_BUDGET_MSG="${HAL_REASONING_BUDGET_MESSAGE:-}"
+POLL_LEVEL="${HAL_POLL:-}"
+NO_REASONING_PRESERVE="${HAL_NO_REASONING_PRESERVE:-1}"
 SLICE="${HAL_SYSTEMD_SLICE-heavy.slice}"
 
-if [ ! -x "${OLLAMA_LIB}/llama-server" ]; then
-  echo "Error: llama-server not found at ${OLLAMA_LIB}/llama-server (set OLLAMA_LIB)." >&2
+if [ -n "${HAL_LLAMA_SERVER:-}" ]; then
+  LLAMA_BIN="${HAL_LLAMA_SERVER}"
+  WORK_DIR="$(dirname "${LLAMA_BIN}")"
+  export LD_LIBRARY_PATH="${WORK_DIR}:${SYSTEM_CUDA_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  ENGINE_LABEL="custom (${LLAMA_BIN})"
+elif [ "${HAL_USE_BUNDLED_LLAMA:-0}" != "1" ] && [ -x "${NATIVE_BIN}" ]; then
+  LLAMA_BIN="${NATIVE_BIN}"
+  WORK_DIR="$(dirname "${LLAMA_BIN}")"
+  export LD_LIBRARY_PATH="${WORK_DIR}:${SYSTEM_CUDA_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  ENGINE_LABEL="native Blackwell sm_121a (${LLAMA_BIN})"
+else
+  LLAMA_BIN="${OLLAMA_LIB}/llama-server"
+  WORK_DIR="${CUDA_DIR}"
+  export LD_LIBRARY_PATH="${OLLAMA_LIB}:${CUDA_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  ENGINE_LABEL="bundled Ollama CUDA 13 (${LLAMA_BIN})"
+fi
+
+if [ ! -x "${LLAMA_BIN}" ]; then
+  echo "Error: llama-server not found at ${LLAMA_BIN} (build ${NATIVE_BIN} or set OLLAMA_LIB / HAL_LLAMA_SERVER)." >&2
   exit 1
 fi
 if [ ! -f "${MODEL_BLOB}" ]; then
@@ -35,7 +62,7 @@ if [ ! -f "${TEMPLATE_FILE}" ]; then
 fi
 
 export CUDA_CACHE_MAXSIZE=4294967296
-export LD_LIBRARY_PATH="${OLLAMA_LIB}:${CUDA_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export GGML_CUDA_GRAPH_CHUNK_SIZE="${GGML_CUDA_GRAPH_CHUNK_SIZE:-0}"
 
 SERVER_ARGS=(
   --host 127.0.0.1 --port "${PORT}"
@@ -49,7 +76,7 @@ SERVER_ARGS=(
   --spec-draft-p-min 0
   -ngl 999 --device CUDA0
   -c 4096 --parallel 1
-  -fa on -ctk f16 -ctv f16 -b 512 -ub 512
+  -fa on -ctk "${CACHE_TYPE_K}" -ctv "${CACHE_TYPE_V}" -b "${BATCH_SIZE}" -ub "${UBATCH_SIZE}"
   --load-mode none --jinja
   --chat-template-file "${TEMPLATE_FILE}"
   --reasoning-format deepseek
@@ -57,11 +84,23 @@ SERVER_ARGS=(
   --chat-template-kwargs '{"reasoning_strength":"low"}'
 )
 
-if [ -n "${SLICE}" ] && command -v systemd-run >/dev/null 2>&1 && systemctl --user status "${SLICE}" >/dev/null 2>&1; then
-  exec systemd-run --user --slice="${SLICE}" --scope \
-    --working-directory="${CUDA_DIR}" \
-    "${OLLAMA_LIB}/llama-server" "${SERVER_ARGS[@]}" "$@"
+if [ -n "${REASONING_BUDGET_MSG}" ]; then
+  SERVER_ARGS+=(--reasoning-budget-message "${REASONING_BUDGET_MSG}")
+fi
+if [ -n "${POLL_LEVEL}" ]; then
+  SERVER_ARGS+=(--poll "${POLL_LEVEL}")
+fi
+if [ "${NO_REASONING_PRESERVE}" = "1" ]; then
+  SERVER_ARGS+=(--no-reasoning-preserve)
 fi
 
-cd "${CUDA_DIR}"
-exec "${OLLAMA_LIB}/llama-server" "${SERVER_ARGS[@]}" "$@"
+echo "Launching Muse-Glimmer-30B + DFlash-${DRAFT_N_MAX} via ${ENGINE_LABEL}" >&2
+
+if [ -n "${SLICE}" ] && command -v systemd-run >/dev/null 2>&1 && systemctl --user status "${SLICE}" >/dev/null 2>&1; then
+  exec systemd-run --user --slice="${SLICE}" --scope \
+    --working-directory="${WORK_DIR}" \
+    "${LLAMA_BIN}" "${SERVER_ARGS[@]}" "$@"
+fi
+
+cd "${WORK_DIR}"
+exec "${LLAMA_BIN}" "${SERVER_ARGS[@]}" "$@"
