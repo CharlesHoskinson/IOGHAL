@@ -1,4 +1,4 @@
-"""Standalone verification test: clone voice with VoxCPM2, verify via Whisper, and test Qwen."""
+"""Standalone verification test: clone voice with VoxCPM2, verify via Whisper, and test Liquid."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 
-from hal9000.brain import QwenBrain
+from hal9000.brain import OllamaBrain
 from hal9000.stt import WhisperSTT
 from hal9000.tts import (
     DEFAULT_PROJECT_DIR,
@@ -33,7 +33,7 @@ def _norm_words(text: str) -> set[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Test VoxCPM2 voice cloning, streaming, Whisper, and Qwen")
+    parser = argparse.ArgumentParser(description="Test VoxCPM2 voice cloning, streaming, Whisper, and Liquid")
     parser.add_argument("--text", default=DEFAULT_TEXT)
     parser.add_argument(
         "--output",
@@ -104,26 +104,26 @@ def main() -> None:
     if overlap < 0.35:
         sys.exit(f"FAIL: Transcript overlap too low ({overlap:.2f}): {transcript!r}")
 
-    print("5) Testing Qwen brain (Ollama)...")
-    brain = QwenBrain()
+    print("5) Testing Liquid brain (Ollama)...")
+    brain = OllamaBrain()
     try:
         reply_parts = list(
             brain.stream_reply_sentences("HAL, introduce yourself and confirm all systems are ready.")
         )
         reply = " ".join(reply_parts)
         if not reply:
-            sys.exit("FAIL: Qwen returned an empty reply.")
-        print(f"   Qwen ({brain.model}) replied: {reply!r}")
+            sys.exit("FAIL: Liquid returned an empty reply.")
+        print(f"   Liquid ({brain.model}) replied: {reply!r}")
     finally:
         brain.close()
 
-    qwen_out = args.output.with_name("hal9000_qwen_reply.wav")
+    model_out = args.output.with_name("hal9000_model_reply.wav")
     t2 = time.perf_counter()
-    qwen_wav = tts.synthesize(reply, seed=42)
-    qwen_dur = len(qwen_wav) / tts.sample_rate
-    sf.write(str(qwen_out), qwen_wav, tts.sample_rate)
+    model_wav = tts.synthesize(reply, seed=42)
+    model_dur = len(model_wav) / tts.sample_rate
+    sf.write(str(model_out), model_wav, tts.sample_rate)
     print(
-        f"   Saved {qwen_out} | duration={qwen_dur:.2f}s | gen={time.perf_counter() - t2:.2f}s"
+        f"   Saved {model_out} | duration={model_dur:.2f}s | gen={time.perf_counter() - t2:.2f}s"
     )
 
     if args.play:

@@ -1,11 +1,13 @@
-"""IOGHAL — Pluggable local GPU Push-to-Talk voice runtime (VoxCPM2 + Qwen + Whisper)."""
+"""IOGHAL — Pluggable local GPU Push-to-Talk voice runtime (VoxCPM2 + Liquid + Whisper)."""
 
 from .audio import MAX_RECORDING_SECONDS, MicRecorder, StreamingAudioPlayer
 from .brain import (
     HAL_SYSTEM_PROMPT,
     POD_BAY_REPLY,
     LoreIndex,
+    OllamaBrain,
     QwenBrain,
+    choose_default_model,
     choose_default_qwen_model,
     is_pod_bay_open_request,
     list_ollama_models,
@@ -37,12 +39,14 @@ __all__ = [
     "HalVoiceEngine",
     "LoreIndex",
     "MicRecorder",
+    "OllamaBrain",
     "QwenBrain",
     "STTProvider",
     "StreamingAudioPlayer",
     "TTSProvider",
     "TurnResult",
     "WhisperSTT",
+    "choose_default_model",
     "choose_default_qwen_model",
     "create_app",
     "create_hal_router",

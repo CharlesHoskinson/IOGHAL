@@ -34,13 +34,23 @@ const MAX_TEXT_CHARS = 4000;
 const MAX_LOG_ENTRIES = 200;
 const GRILLE_SLOTS = 7;
 
+function float32ToBase64(samples: Float32Array): string {
+  const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
+  let binary = '';
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + step));
+  }
+  return btoa(binary);
+}
+
 export default function App() {
   const [connected, setConnected] = useState(false);
   const [ready, setReady] = useState(false);
   const [halState, setHalState] = useState<HalState>('loading');
   const [statusText, setStatusText] = useState('CONNECTING TO DISCOVERY ONE...');
   const [models, setModels] = useState<string[]>([]);
-  const [currentModel, setCurrentModel] = useState('qwen3.5:9b-q8_0');
+  const [currentModel, setCurrentModel] = useState('');
   const [steps, setSteps] = useState<number>(6);
   const [sampleRate, setSampleRate] = useState<number>(48000);
   const [localMicAllowed, setLocalMicAllowed] = useState<boolean>(true);
@@ -262,12 +272,6 @@ export default function App() {
         merged.set(c, offset);
         offset += c.length;
       }
-      const bytes = new Uint8Array(merged.buffer);
-      let binary = '';
-      const step = 0x8000;
-      for (let i = 0; i < bytes.length; i += step) {
-        binary += String.fromCharCode(...bytes.subarray(i, i + step));
-      }
       const turnId = mintTurnId();
       pendingTurnRef.current = true;
       setHalState('thinking');
@@ -275,7 +279,7 @@ export default function App() {
       sendJson({
         type: 'audio_b64',
         turn_id: turnId,
-        pcm_b64: btoa(binary),
+        pcm_b64: float32ToBase64(merged),
         sample_rate: sess.sampleRate,
       });
     },
@@ -531,10 +535,12 @@ export default function App() {
             setStreamingHal('');
             if (!(playerRef.current?.isPlaying ?? false) && !pttActiveRef.current) {
               pendingTurnRef.current = false;
-              if (!failed) {
-                setHalState('idle');
-                setStatusText('ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK');
-              }
+              setHalState('idle');
+              setStatusText(
+                failed
+                  ? 'TURN ERROR — HOLD OR TAP SPACE TO TALK'
+                  : 'ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK',
+              );
             }
             break;
           }
@@ -553,8 +559,18 @@ export default function App() {
           }
           case 'error': {
             if (isStaleTurn) break;
-            pendingTurnRef.current = false;
             appendEntry('ERROR', msg.message || 'Unknown error');
+            // Turn-scoped errors clear pending turn & reset idle UI so a bad upload or
+            // mid-turn failure never leaves the console stuck in thinking/speaking.
+            // Non-turn errors (e.g. invalid set_model) must NOT clobber an active turn.
+            if (msgTurnId !== null) {
+              pendingTurnRef.current = false;
+              playerRef.current?.stop();
+              if (!pttActiveRef.current) {
+                setHalState('idle');
+                setStatusText('TURN ERROR — HOLD OR TAP SPACE TO TALK');
+              }
+            }
             break;
           }
         }
@@ -887,12 +903,27 @@ export default function App() {
     const ok = await playerRef.current?.resumeNow();
     if (ok) {
       playerRef.current?.flushPrebuffer();
+      if (playerRef.current?.isPlaying && !pttActiveRef.current) {
+        setHalState('speaking');
+        setStatusText('HAL 9000 SPEAKING...');
+      }
     }
   };
 
-  const handleReplay = () => {
-    if (pttActiveRef.current || !playerRef.current?.hasReplay) return;
-    playerRef.current.ensureContext();
+  const handleReplay = async () => {
+    if (
+      pttActiveRef.current ||
+      pendingTurnRef.current ||
+      halState === 'thinking' ||
+      halState === 'speaking' ||
+      !playerRef.current?.hasReplay
+    ) {
+      return;
+    }
+    const ok = await playerRef.current.resumeNow();
+    if (!ok || pttActiveRef.current || pendingTurnRef.current || !playerRef.current?.hasReplay) {
+      return;
+    }
     if (playerRef.current.replayLast()) {
       setHalState('speaking');
       setStatusText('REPLAYING LAST TRANSMISSION...');
@@ -1044,7 +1075,7 @@ export default function App() {
               )}
 
               <select
-                aria-label="Qwen Model"
+                aria-label="LLM Model"
                 className="ctrl-select"
                 disabled={!connected}
                 value={currentModel}
@@ -1055,7 +1086,8 @@ export default function App() {
                   e.target.blur();
                 }}
               >
-                {(models.length ? models : [currentModel]).map((m) => (
+                {!currentModel && <option value="">Connecting…</option>}
+                {(models.length ? models : currentModel ? [currentModel] : []).map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
@@ -1116,7 +1148,7 @@ export default function App() {
                 <button
                   type="button"
                   className="ctrl-btn"
-                  disabled={pttEngaged}
+                  disabled={pttEngaged || halState === 'thinking' || halState === 'speaking'}
                   title="Replay the last completed HAL transmission"
                   onClick={(e) => {
                     handleReplay();

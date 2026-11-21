@@ -18,6 +18,7 @@ export interface SystemStatusMessage {
   model?: string;
   models: string[];
   ollama_available?: boolean;
+  llama_server_available?: boolean;
   local_mic_allowed?: boolean;
   sample_rate: number;
   max_duration_s?: number;
@@ -46,7 +47,7 @@ export type ServerMessage =
   | { type: 'cleared'; turn_id?: number }
   | { type: 'error'; turn_id?: number; message?: string };
 
-const DEFAULT_PREBUFFER_SEC = 0.45;
+const DEFAULT_PREBUFFER_SEC = 0.35;
 const PCM_HEADER_BYTES = 4;
 
 /** Parse a binary WebSocket PCM frame prefixed with a 4-byte little-endian uint32 turn_id. */
@@ -88,6 +89,7 @@ export class HalAudioPlayer {
   private lastReplayPcm: Float32Array | null = null;
   private lastReplaySampleRate = 48000;
   private underrunCount = 0;
+  private playbackGen = 0;
   private callbacks: AudioPlayerCallbacks;
 
   constructor(callbacks: AudioPlayerCallbacks) {
@@ -96,6 +98,10 @@ export class HalAudioPlayer {
 
   get isPlaying(): boolean {
     return this.activeSources.size > 0;
+  }
+
+  get hasPendingPrebuffer(): boolean {
+    return this.prebufferSamples > 0;
   }
 
   get isServerDone(): boolean {
@@ -269,6 +275,11 @@ export class HalAudioPlayer {
 
   replayLast(): boolean {
     if (!this.lastReplayPcm || this.lastReplayPcm.length === 0) return false;
+    const ctx = this.ensureContext();
+    if (ctx.state !== 'running') {
+      this.callbacks.onSuspendedChange(true);
+      return false;
+    }
     this.stop();
     this.sampleRate = this.lastReplaySampleRate;
     this.serverDone = true;
@@ -283,7 +294,9 @@ export class HalAudioPlayer {
     const gain = this.gain;
     if (!gain) return;
 
-    const samples = applyFadeIn ? this.withShortFadeIn(pcm) : pcm;
+    const now = ctx.currentTime;
+    const hadGap = this.nextPlayTime <= now;
+    const samples = applyFadeIn || hadGap ? this.withShortFadeIn(pcm) : pcm;
     const audioBuf = ctx.createBuffer(1, samples.length, this.sampleRate);
     audioBuf.copyToChannel(samples, 0);
 
@@ -291,11 +304,11 @@ export class HalAudioPlayer {
     src.buffer = audioBuf;
     src.connect(gain);
 
-    const now = ctx.currentTime;
     // Preserve exact future cursor (no artificial gaps); add 25ms lead only when starting fresh/underrun
-    const startAt = this.nextPlayTime > now ? this.nextPlayTime : now + 0.025;
+    const startAt = hadGap ? now + 0.025 : this.nextPlayTime;
     this.nextPlayTime = startAt + audioBuf.duration;
 
+    const myGen = this.playbackGen;
     this.activeSources.add(src);
     src.onended = () => {
       try {
@@ -304,6 +317,7 @@ export class HalAudioPlayer {
         // ignore
       }
       this.activeSources.delete(src);
+      if (myGen !== this.playbackGen) return;
       if (this.activeSources.size === 0 && this.serverDone) {
         this.callbacks.onPlaybackIdle();
       }
@@ -333,6 +347,7 @@ export class HalAudioPlayer {
   }
 
   stop(): void {
+    this.playbackGen += 1;
     this.prebuffer = [];
     this.prebufferSamples = 0;
     this.playbackStarted = false;

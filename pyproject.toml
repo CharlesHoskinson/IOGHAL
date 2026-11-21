@@ -1,7 +1,7 @@
 [project]
 name = "ioghal"
 version = "0.2.0"
-description = "IOGHAL — Pluggable local GPU Push-to-Talk voice runtime powered by VoxCPM2, Qwen (Ollama), and Whisper Large v3"
+description = "IOGHAL — Pluggable local GPU Push-to-Talk voice runtime powered by VoxCPM2, Muse-Glimmer / Ollama, and Whisper Large v3"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = "==3.12.*"

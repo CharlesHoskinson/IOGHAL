@@ -6,17 +6,20 @@ import argparse
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
+import os
 import struct
 import threading
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
+import httpx
 import numpy as np
 import sounddevice as sd
 import uvicorn
@@ -25,7 +28,16 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .audio import MAX_RECORDING_SECONDS, MicRecorder
-from .brain import LoreIndex, QwenBrain, choose_default_qwen_model, list_ollama_models
+from .brain import (
+    DEFAULT_OLLAMA_NUM_CTX,
+    HAL_SYSTEM_PROMPT,
+    LoreIndex,
+    OllamaBrain,
+    choose_default_model,
+    is_glimmer_model,
+    list_llama_server_models,
+    list_ollama_models,
+)
 from .interfaces import BrainProvider, HalConfig, HalEvent, STTProvider, TTSProvider
 from .pipeline import HalPipeline
 from .stt import WhisperSTT
@@ -89,6 +101,10 @@ class HalRuntime:
         model: str | None = None,
         ref_wav: Path | None = None,
         ollama_url: str | None = None,
+        llama_server_url: str | None = None,
+        llm_backend: Literal["auto", "ollama", "llama_server"] | None = None,
+        thinking_mode: Literal["auto", "off", "low"] | None = None,
+        reasoning_budget: int | None = None,
         compile_model: bool | None = None,
         steps: int | None = None,
         host: str | None = None,
@@ -98,9 +114,48 @@ class HalRuntime:
         brain_factory: Callable[[HalRuntime], BrainProvider] | None = None,
     ) -> None:
         cfg = config or HalConfig()
+        env_llama_url = os.environ.get("HAL_LLAMA_SERVER_URL") or None
+        env_backend = os.environ.get("HAL_LLM_BACKEND") or None
+        env_thinking = os.environ.get("HAL_THINKING_MODE") or None
+        env_budget_raw = os.environ.get("HAL_REASONING_BUDGET")
+        env_budget = int(env_budget_raw) if env_budget_raw and env_budget_raw.isdigit() else None
+
+        resolved_llama_url = (
+            llama_server_url
+            if llama_server_url is not None
+            else (cfg.llama_server_url if cfg.llama_server_url is not None else env_llama_url)
+        )
+        resolved_backend: Literal["auto", "ollama", "llama_server"] = (
+            llm_backend
+            if llm_backend is not None
+            else (
+                env_backend  # type: ignore[assignment]
+                if cfg.llm_backend == "auto" and env_backend in ("auto", "ollama", "llama_server")
+                else cfg.llm_backend
+            )
+        )
+        resolved_thinking: Literal["auto", "off", "low"] = (
+            thinking_mode
+            if thinking_mode is not None
+            else (
+                env_thinking  # type: ignore[assignment]
+                if cfg.thinking_mode == "auto" and env_thinking in ("auto", "off", "low")
+                else cfg.thinking_mode
+            )
+        )
+        resolved_budget = (
+            reasoning_budget
+            if reasoning_budget is not None
+            else (env_budget if env_budget is not None else cfg.reasoning_budget)
+        )
+
         self.config = HalConfig(
             model=model if model is not None else cfg.model,
             ollama_url=ollama_url if ollama_url is not None else cfg.ollama_url,
+            llm_backend=resolved_backend,
+            llama_server_url=resolved_llama_url,
+            thinking_mode=resolved_thinking,
+            reasoning_budget=max(0, int(resolved_budget)),
             ref_wav=resolve_reference_wav(ref_wav if ref_wav is not None else cfg.ref_wav),
             ref_text=cfg.ref_text,
             steps=steps if steps is not None else cfg.steps,
@@ -121,6 +176,9 @@ class HalRuntime:
 
         self.ref_wav = self.config.ref_wav
         self.ollama_url = self.config.ollama_url
+        self.llama_server_url = (
+            self.config.llama_server_url.rstrip("/") if self.config.llama_server_url else None
+        )
         self.compile_model = self.config.compile_model
         self.steps = self.config.steps
         self.host = self.config.host
@@ -129,14 +187,33 @@ class HalRuntime:
         self.allowed_hosts = set(LOOPBACK_HOSTS) | {self.host.lower()}
         self._brain_factory = brain_factory
 
-        # Single tag discovery call; expose Ollama availability separately
-        discovered = list_ollama_models(self.ollama_url)
-        self.ollama_available: bool = len(discovered) > 0
-        self.default_model: str = self.config.model or choose_default_qwen_model(
-            self.ollama_url, models=discovered
+        # Discover llama-server and Ollama models once cleanly
+        llama_discovered = (
+            list_llama_server_models(self.llama_server_url)
+            if self.llama_server_url and self.config.llm_backend != "ollama"
+            else []
+        )
+        ollama_discovered = (
+            list_ollama_models(self.ollama_url)
+            if self.config.llm_backend != "llama_server"
+            else []
+        )
+        self.llama_server_models: set[str] = set(llama_discovered)
+        self.llama_server_available: bool = len(llama_discovered) > 0
+        self.ollama_available: bool = len(ollama_discovered) > 0
+        discovered = [
+            *llama_discovered,
+            *(m for m in ollama_discovered if m not in self.llama_server_models),
+        ]
+        self.default_model: str = self.config.model or (
+            llama_discovered[0]
+            if llama_discovered
+            else choose_default_model(self.ollama_url, models=discovered)
         )
         self.models: list[str] = (
-            discovered if self.default_model in discovered else [self.default_model, *discovered]
+            list(discovered)
+            if self.default_model in discovered
+            else [self.default_model, *discovered]
         )
         self.lore_index = LoreIndex(self.config.lore_dir)
 
@@ -156,20 +233,37 @@ class HalRuntime:
         self.mic_owner: WebSocket | None = None
         self._shutdown_event = threading.Event()
         self._loader_thread: threading.Thread | None = None
+        self._ollama_warmup_lock = threading.Lock()
+        self._warmup_http_lock = threading.Lock()
+        self._ollama_warmup_seq = 0
+        self._active_warmup_clients: set[Any] = set()
+        self._active_ollama_model: str | None = None
 
         # Per-connection single-writer callbacks (never call ws.send_* directly from broadcast)
         self._listeners: dict[WebSocket, Callable[[dict[str, Any]], None]] = {}
         self._active_closers: dict[WebSocket, Callable[[], None]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
 
+    def _is_llama_server_model(self, model: str) -> bool:
+        if self.config.llm_backend == "llama_server":
+            return True
+        if self.config.llm_backend == "ollama":
+            return False
+        return bool(self.llama_server_url) and model in self.llama_server_models
+
     def create_brain(self) -> BrainProvider:
         if self._brain_factory is not None:
             return self._brain_factory(self)
-        return QwenBrain(
+        return OllamaBrain(
             model=self.default_model,
             base_url=self.ollama_url,
             user_name=self.config.user_name,
             lore_index=self.lore_index,
+            backend=self.config.llm_backend,
+            llama_server_url=self.llama_server_url,
+            llama_server_models=self.llama_server_models,
+            thinking_mode=self.config.thinking_mode,
+            reasoning_budget=self.config.reasoning_budget,
         )
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -198,6 +292,7 @@ class HalRuntime:
     def shutdown(self) -> None:
         """Cancel in-flight work and notify all active connections to close cleanly."""
         self._shutdown_event.set()
+        self.cancel_inflight_warmups()
         for closer in list(self._active_closers.values()):
             try:
                 closer()
@@ -206,38 +301,177 @@ class HalRuntime:
         if self._loader_thread is not None and self._loader_thread.is_alive():
             self._loader_thread.join(timeout=2.0)
 
-    def _warmup_ollama_async(self) -> None:
-        if not self.ollama_available:
+    def cancel_inflight_warmups(self) -> None:
+        """Abort any active warmup HTTP probes so a newer set_model or live turn is never stalled."""
+        with self._ollama_warmup_lock:
+            self._ollama_warmup_seq += 1
+            clients = list(self._active_warmup_clients)
+            self._active_warmup_clients.clear()
+        for client in clients:
+            with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
+                client.close()
+
+    def _run_cancellable_post(
+        self, url: str, payload: dict[str, Any], seq: int | None
+    ) -> bool:
+        client = httpx.Client(
+            timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
+        )
+        with self._ollama_warmup_lock:
+            if self._shutdown_event.is_set() or (
+                seq is not None and seq != self._ollama_warmup_seq
+            ):
+                client.close()
+                return False
+            self._active_warmup_clients.add(client)
+        try:
+            client.post(url, json=payload).raise_for_status()
+            return True
+        finally:
+            with self._ollama_warmup_lock:
+                self._active_warmup_clients.discard(client)
+            with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
+                client.close()
+
+    def _warmup_ollama_async(self, model: str | None = None, seq: int | None = None) -> None:
+        if self._shutdown_event.is_set():
+            return
+        target_model = model or self.default_model
+        use_llama_server = self._is_llama_server_model(target_model)
+
+        # Quint Bug 1d fix: serialize all warmup/unload HTTP calls under _warmup_http_lock
+        # and re-check seq atomically before opening each tracked client so stale warmups can never evict.
+        with self._warmup_http_lock:
+            with self._ollama_warmup_lock:
+                if self._shutdown_event.is_set() or (
+                    seq is not None and seq != self._ollama_warmup_seq
+                ):
+                    return
+                prev_ollama = self._active_ollama_model
+
+            try:
+                if use_llama_server:
+                    # Quint Bug 1b fix: unload any previously resident Ollama model before using llama-server
+                    if prev_ollama and self.ollama_available:
+                        try:
+                            if self._run_cancellable_post(
+                                f"{self.ollama_url.rstrip('/')}/api/chat",
+                                {"model": prev_ollama, "messages": [], "keep_alive": 0},
+                                seq,
+                            ):
+                                with self._ollama_warmup_lock:
+                                    if self._active_ollama_model == prev_ollama:
+                                        self._active_ollama_model = None
+                                logger.info(
+                                    "Unloaded Ollama model %s before activating llama-server %s.",
+                                    prev_ollama,
+                                    target_model,
+                                )
+                        except (httpx.HTTPError, OSError) as exc:
+                            logger.debug("Ollama unload skipped for %s: %s", prev_ollama, exc)
+
+                    if not self.llama_server_url:
+                        return
+                    sys_prompt = HAL_SYSTEM_PROMPT.format(user_name=self.config.user_name)
+                    warm_payload: dict[str, Any] = {
+                        "model": target_model,
+                        "messages": [
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": "Ready."},
+                        ],
+                        "stream": False,
+                        "cache_prompt": True,
+                        "max_tokens": 1,
+                        "temperature": 0.0,
+                        "reasoning_budget_tokens": 0,
+                        "chat_template_kwargs": (
+                            {"enable_thinking": False, "reasoning_strength": "low"}
+                            if is_glimmer_model(target_model)
+                            else {"enable_thinking": False}
+                        ),
+                    }
+                    if is_glimmer_model(target_model):
+                        warm_payload["reasoning_format"] = "deepseek"
+                    if self._run_cancellable_post(
+                        f"{self.llama_server_url}/v1/chat/completions",
+                        warm_payload,
+                        seq,
+                    ):
+                        logger.info("Warmed llama-server KV prefix for %s.", target_model)
+                    return
+
+                if not self.ollama_available:
+                    return
+                if self._run_cancellable_post(
+                    f"{self.ollama_url.rstrip('/')}/api/chat",
+                    {
+                        "model": target_model,
+                        "messages": [],
+                        "keep_alive": "30m",
+                        "options": {"num_ctx": DEFAULT_OLLAMA_NUM_CTX},
+                    },
+                    seq,
+                ):
+                    with self._ollama_warmup_lock:
+                        if seq is None or seq == self._ollama_warmup_seq:
+                            self._active_ollama_model = target_model
+                    logger.info("Preloaded Ollama model %s into memory.", target_model)
+            except (httpx.HTTPError, OSError) as exc:
+                logger.warning("LLM preload skipped for %s: %s", target_model, exc)
+
+    def schedule_ollama_warmup(self, model: str | None = None) -> None:
+        target_model = model or self.default_model
+        use_llama_server = self._is_llama_server_model(target_model)
+        if self._shutdown_event.is_set():
+            return
+        if use_llama_server and not self.llama_server_url:
+            return
+        if not use_llama_server and not self.ollama_available:
+            return
+        with self._ollama_warmup_lock:
+            self._ollama_warmup_seq += 1
+            seq = self._ollama_warmup_seq
+            if not use_llama_server:
+                self._active_ollama_model = target_model
+            stale_clients = list(self._active_warmup_clients)
+            self._active_warmup_clients.clear()
+        for client in stale_clients:
+            with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
+                client.close()
+        threading.Thread(
+            target=self._warmup_ollama_async,
+            args=(target_model, seq),
+            daemon=True,
+        ).start()
+
+    def _warmup_tts_async(self) -> None:
+        if self._shutdown_event.is_set() or self.tts is None:
+            return
+        if not self.gpu_lock.acquire(blocking=False):
             return
         try:
-            import httpx
-
-            with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)) as client:
-                client.post(
-                    f"{self.ollama_url.rstrip('/')}/api/chat",
-                    json={"model": self.default_model, "messages": [], "keep_alive": "30m"},
-                )
-            logger.info("Preloaded Ollama model %s into memory.", self.default_model)
-        except (httpx.HTTPError, OSError) as exc:
-            logger.warning("Ollama preload skipped for %s: %s", self.default_model, exc)
+            if isinstance(self.tts, HalVoiceEngine):
+                self.tts.warmup_streaming(seed=42, max_chunks=1)
+            else:
+                _ = self.tts.synthesize("Yes.", seed=42)
+            if not self._shutdown_event.is_set() and isinstance(self.stt, WhisperSTT):
+                self.stt.warmup()
+        except (RuntimeError, ValueError, OSError) as exc:
+            logger.debug("Background GPU warmup skipped: %s", exc)
+        finally:
+            self.gpu_lock.release()
 
     def _load_models(self) -> None:
         try:
-            # Overlap Ollama model residency preload with local Whisper + VoxCPM2 load
-            if self.ollama_available:
-                threading.Thread(target=self._warmup_ollama_async, daemon=True).start()
+            t_boot = time.perf_counter()
+            self.stage = "LOADING WHISPER LARGE-V3 + VOXCPM2..."
+            self._broadcast_from_thread(self.status_payload(include_model=False))
 
+            # Load WhisperSTT and HalVoiceEngine sequentially so CUDA graph captures & RNG state never race across threads.
             if self.stt is None:
-                self.stage = "LOADING WHISPER LARGE-V3..."
-                self._broadcast_from_thread(self.status_payload(include_model=False))
                 self.stt = WhisperSTT(model_id=self.config.whisper_model_id)
 
-            if self._shutdown_event.is_set():
-                return
-
             if self.tts is None:
-                self.stage = "LOADING VOXCPM2 + VOICE PROMPT CACHE..."
-                self._broadcast_from_thread(self.status_payload(include_model=False))
                 self.tts = HalVoiceEngine(
                     model_id=self.config.voxcpm_model_id,
                     reference_wav=self.ref_wav,
@@ -251,18 +485,14 @@ class HalRuntime:
             if self._shutdown_event.is_set():
                 return
 
-            self.stage = "WARMING UP STREAMING AUDIO PIPELINE..."
-            self._broadcast_from_thread(self.status_payload(include_model=False))
-            with self.gpu_lock:
-                if isinstance(self.tts, HalVoiceEngine):
-                    self.tts.warmup_streaming(seed=42)
-                else:
-                    _ = self.tts.synthesize("Affirmative.", seed=42)
-
             self.ready = True
             self.stage = "ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK"
             self._broadcast_from_thread(self.status_payload(include_model=False))
-            logger.info("IOGHAL runtime fully operational.")
+            logger.info("IOGHAL runtime operational in %.2fs.", time.perf_counter() - t_boot)
+
+            # Warm CUDA streaming kernels and preload Ollama after weights are resident
+            threading.Thread(target=self._warmup_tts_async, daemon=True).start()
+            self.schedule_ollama_warmup(self.default_model)
         except Exception as exc:
             logger.exception("Failed to initialize IOGHAL runtime")
             self.error = str(exc)
@@ -284,6 +514,7 @@ class HalRuntime:
             "state": state,
             "models": self.models,
             "ollama_available": self.ollama_available,
+            "llama_server_available": self.llama_server_available,
             "local_mic_allowed": self.is_loopback,
             "sample_rate": self.sample_rate,
             "max_duration_s": MAX_RECORDING_SECONDS,
@@ -333,7 +564,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
         last_level_ts = 0.0
 
         # Queue holds (kind, payload, gen_or_none) so retired audio is discarded before transmission
-        out_queue: asyncio.Queue[tuple[str, Any, int | None] | None] = asyncio.Queue(maxsize=192)
+        out_queue: asyncio.Queue[tuple[str, Any, int | None] | None] = asyncio.Queue(maxsize=512)
 
         def current_gen() -> int:
             with state_lock:
@@ -423,13 +654,36 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                 turn_gen += 1
                 active_cancel = threading.Event()
                 wire_tid = client_tid if client_tid is not None else turn_gen
-                return wire_tid, turn_gen, active_cancel
+                cancel_ev = active_cancel
+                gen_now = turn_gen
+            runtime.cancel_inflight_warmups()
+            cancel_fn = getattr(brain, "cancel_inflight", None)
+            if callable(cancel_fn):
+                cancel_fn()
+            return wire_tid, gen_now, cancel_ev
 
         def cancel_active_turn() -> None:
             nonlocal turn_gen
             with state_lock:
                 active_cancel.set()
                 turn_gen += 1
+            cancel_fn = getattr(brain, "cancel_inflight", None)
+            if callable(cancel_fn):
+                cancel_fn()
+
+        def reject_turn(tid: int | None, message: str, detail: str | None = None) -> None:
+            """Quint-verified rejection: always pair turn-scoped error with idle state."""
+            cancel_active_turn()
+            enqueue_on_loop("json", {"type": "error", "turn_id": tid, "message": message})
+            enqueue_on_loop(
+                "json",
+                {
+                    "type": "state",
+                    "turn_id": tid,
+                    "state": "idle",
+                    "detail": detail or "ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK",
+                },
+            )
 
         def on_mic_level(lvl: float) -> None:
             nonlocal last_level_ts
@@ -478,6 +732,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
         ) -> None:
             if turn_cancel.is_set() or ws_closed.is_set():
                 return
+
             if not runtime.ready or runtime.tts is None or runtime.stt is None:
                 send_json_threadsafe(
                     {
@@ -487,7 +742,20 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                     },
                     my_gen,
                 )
+                send_json_threadsafe(
+                    {
+                        "type": "state",
+                        "turn_id": wire_tid,
+                        "state": "idle",
+                        "detail": "INITIALIZING NEURAL SUBSYSTEMS...",
+                    },
+                    my_gen,
+                )
                 return
+
+            if not runtime._is_llama_server_model(brain.model) and runtime.ollama_available:
+                with runtime._ollama_warmup_lock:
+                    runtime._active_ollama_model = brain.model
 
             pipeline = HalPipeline(
                 brain=brain,
@@ -544,6 +812,14 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
 
                 if mtype == "ptt_start":
                     if not runtime.ready:
+                        enqueue_on_loop(
+                            "json",
+                            {
+                                "type": "capture_failed",
+                                "capture_id": capture_id,
+                                "message": "IOGHAL is still initializing.",
+                            },
+                        )
                         continue
                     if not runtime.is_loopback:
                         enqueue_on_loop(
@@ -642,6 +918,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
 
                 elif mtype == "audio_b64":
                     if not runtime.ready:
+                        reject_turn(client_tid, "IOGHAL is still initializing.", "INITIALIZING NEURAL SUBSYSTEMS...")
                         continue
                     if mic.is_recording:
                         await stop_local_mic_async()
@@ -652,34 +929,22 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                         or not pcm_b64
                         or len(pcm_b64) > MAX_AUDIO_B64_CHARS
                     ):
-                        enqueue_on_loop(
-                            "json",
-                            {"type": "error", "turn_id": client_tid, "message": "Invalid audio payload."},
-                        )
+                        reject_turn(client_tid, "Invalid audio payload.")
                         continue
                     if (
                         isinstance(sr, bool)
                         or not isinstance(sr, int)
                         or not (MIN_SAMPLE_RATE <= sr <= MAX_SAMPLE_RATE)
                     ):
-                        enqueue_on_loop(
-                            "json",
-                            {"type": "error", "turn_id": client_tid, "message": "Invalid sample rate."},
-                        )
+                        reject_turn(client_tid, "Invalid sample rate.")
                         continue
                     try:
                         pcm_bytes = base64.b64decode(pcm_b64, validate=True)
                     except (binascii.Error, ValueError):
-                        enqueue_on_loop(
-                            "json",
-                            {"type": "error", "turn_id": client_tid, "message": "Malformed base64 audio."},
-                        )
+                        reject_turn(client_tid, "Malformed base64 audio.")
                         continue
                     if len(pcm_bytes) % 4 != 0:
-                        enqueue_on_loop(
-                            "json",
-                            {"type": "error", "turn_id": client_tid, "message": "Unaligned float32 audio."},
-                        )
+                        reject_turn(client_tid, "Unaligned float32 audio.")
                         continue
                     audio = np.frombuffer(pcm_bytes, dtype="<f4").copy()
                     dur_s = audio.size / float(sr)
@@ -695,20 +960,10 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                         )
                         continue
                     if dur_s > MAX_UPLOAD_DURATION_S:
-                        enqueue_on_loop(
-                            "json",
-                            {
-                                "type": "error",
-                                "turn_id": client_tid,
-                                "message": f"Audio exceeds {int(MAX_UPLOAD_DURATION_S)}s limit.",
-                            },
-                        )
+                        reject_turn(client_tid, f"Audio exceeds {int(MAX_UPLOAD_DURATION_S)}s limit.")
                         continue
                     if not np.all(np.isfinite(audio)):
-                        enqueue_on_loop(
-                            "json",
-                            {"type": "error", "turn_id": client_tid, "message": "Non-finite audio samples."},
-                        )
+                        reject_turn(client_tid, "Non-finite audio samples.")
                         continue
 
                     logger.info("Browser audio received: %.2fs @ %d Hz", dur_s, sr)
@@ -723,28 +978,37 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                 elif mtype == "text":
                     raw_text = msg.get("text")
                     if not isinstance(raw_text, str):
-                        continue
-                    text = raw_text.strip()
-                    if not text or not runtime.ready:
-                        continue
-                    if len(text) > MAX_TEXT_CHARS:
-                        cancel_active_turn()
-                        enqueue_on_loop(
-                            "json",
-                            {
-                                "type": "error",
-                                "turn_id": client_tid,
-                                "message": f"Message exceeds {MAX_TEXT_CHARS} characters.",
-                            },
-                        )
                         enqueue_on_loop(
                             "json",
                             {
                                 "type": "state",
                                 "turn_id": client_tid,
                                 "state": "idle",
-                                "detail": f"MESSAGE TOO LONG (MAX {MAX_TEXT_CHARS} CHARS)",
+                                "detail": "ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK",
                             },
+                        )
+                        continue
+                    text = raw_text.strip()
+                    if not text:
+                        # Quint Bug 5d fix: whitespace-only text must ack idle so wire protocol is total
+                        enqueue_on_loop(
+                            "json",
+                            {
+                                "type": "state",
+                                "turn_id": client_tid,
+                                "state": "idle",
+                                "detail": "ALL CIRCUITS OPERATIONAL — HOLD OR TAP SPACE TO TALK",
+                            },
+                        )
+                        continue
+                    if not runtime.ready:
+                        reject_turn(client_tid, "IOGHAL is still initializing.", "INITIALIZING NEURAL SUBSYSTEMS...")
+                        continue
+                    if len(text) > MAX_TEXT_CHARS:
+                        reject_turn(
+                            client_tid,
+                            f"Message exceeds {MAX_TEXT_CHARS} characters.",
+                            f"MESSAGE TOO LONG (MAX {MAX_TEXT_CHARS} CHARS)",
                         )
                         continue
                     if mic.is_recording:
@@ -777,6 +1041,7 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                     new_model = msg.get("model")
                     if isinstance(new_model, str) and new_model in runtime.models:
                         brain.set_model(new_model)
+                        runtime.schedule_ollama_warmup(new_model)
                         enqueue_on_loop(
                             "json", runtime.status_payload(model=brain.model, steps=conn_steps)
                         )
@@ -820,8 +1085,9 @@ def create_hal_router(runtime: HalRuntime, prefix: str = "") -> APIRouter:
                 await stop_local_mic_async()
             except (sd.PortAudioError, OSError, RuntimeError) as exc:
                 logger.debug("Mic cleanup on disconnect failed: %s", exc)
-            if isinstance(brain, QwenBrain):
-                brain.close()
+            close_fn = getattr(brain, "close", None)
+            if callable(close_fn):
+                close_fn()
             writer_task.cancel()
             await asyncio.gather(writer_task, return_exceptions=True)
 
@@ -871,13 +1137,31 @@ def create_app(runtime: HalRuntime, serve_frontend: bool = True) -> FastAPI:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="IOGHAL Web Server (FastAPI + VoxCPM2 + Qwen + Whisper)"
+        description="IOGHAL Web Server (FastAPI + VoxCPM2 + Liquid + Whisper)"
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--model", default=None)
     parser.add_argument("--ref-wav", type=Path, default=None)
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--llama-server-url", default=os.environ.get("HAL_LLAMA_SERVER_URL"))
+    parser.add_argument(
+        "--llm-backend",
+        choices=("auto", "ollama", "llama_server"),
+        default=os.environ.get("HAL_LLM_BACKEND", "auto"),
+    )
+    parser.add_argument(
+        "--thinking-mode",
+        choices=("auto", "off", "low"),
+        default=os.environ.get("HAL_THINKING_MODE", "auto"),
+    )
+    env_budget_raw = os.environ.get("HAL_REASONING_BUDGET", "")
+    default_reasoning_budget = int(env_budget_raw) if env_budget_raw.isdigit() else 64
+    parser.add_argument(
+        "--reasoning-budget",
+        type=int,
+        default=default_reasoning_budget,
+    )
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--steps", type=int, default=6)
     parser.add_argument("--user-name", default="Charles")
@@ -895,6 +1179,10 @@ def main() -> None:
         model=args.model,
         ref_wav=args.ref_wav,
         ollama_url=args.ollama_url,
+        llm_backend=args.llm_backend,
+        llama_server_url=args.llama_server_url,
+        thinking_mode=args.thinking_mode,
+        reasoning_budget=args.reasoning_budget,
         compile_model=args.compile,
         steps=args.steps,
         user_name=args.user_name,

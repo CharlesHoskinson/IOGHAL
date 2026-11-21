@@ -13,12 +13,19 @@ import numpy as np
 
 from hal9000.audio import MicRecorder
 from hal9000.brain import (
+    DEFAULT_LIQUID_MODEL,
+    DEFAULT_SMART_MODEL,
     POD_BAY_REPLY,
+    LoreIndex,
+    OllamaBrain,
     QwenBrain,
     _ThinkStripper,
+    choose_default_model,
     enforce_user_address,
     is_pod_bay_open_request,
+    should_use_low_think,
     split_complete_sentences,
+    split_first_clause,
 )
 from hal9000.interfaces import (
     AudioInput,
@@ -32,6 +39,7 @@ from hal9000.pipeline import HalPipeline
 from hal9000.server import HalRuntime, create_hal_router, is_allowed_origin
 from hal9000.stt import _has_speech_activity
 from hal9000.tts import normalize_for_hal_tts
+from hal9000.websearch import should_search_web
 
 
 class _FakeSTT:
@@ -132,6 +140,12 @@ class TestInterfacesAndBrain(unittest.TestCase):
         out2 = stripper2.feed("internal reasoning</think>Hello Charles.") + stripper2.flush()
         self.assertEqual(out2, "Hello Charles.")
 
+        from hal9000.brain import clean_for_speech
+        self.assertEqual(
+            clean_for_speech("to=user<|message|>Good afternoon, Charles.<|eot|>"),
+            "Good afternoon, Charles.",
+        )
+
     def test_sentence_splitter(self) -> None:
         done, rem = split_complete_sentences(
             'Dr. R. Chandra met Mr. Langley at 3.14. "Dr. Chandra" smiled. Wait... perhaps. I am H.A.L. You know me. '
@@ -151,7 +165,15 @@ class TestInterfacesAndBrain(unittest.TestCase):
     def test_tts_normalization(self) -> None:
         self.assertEqual(
             normalize_for_hal_tts("Dr. Chandra checked HAL 9000 and the AE-35 unit."),
-            "Doctor Chandra checked HAL nine thousand and the A E thirty-five unit.",
+            "Doctor Chandra checked Hal nine thousand and the A E thirty-five unit.",
+        )
+        self.assertEqual(
+            normalize_for_hal_tts("I am HAL, also known as H.A.L., not SAL 9000."),
+            "I am Hal, also known as Hal, not Sal nine thousand.",
+        )
+        self.assertEqual(
+            normalize_for_hal_tts("It will go 100% failure, Mr. Amer, with a 1:4:9 monolith on January 12, 1992."),
+            "It will go a hundred percent failure, Mister Amor, with a one by four by nine monolith on the twelfth of January nineteen ninety two.",
         )
 
     def test_speech_activity_gate(self) -> None:
@@ -347,6 +369,450 @@ class TestPipelineAndServer(unittest.TestCase):
             m for m in sent_json if m.get("type") == "state" and m.get("turn_id") == 9 and m.get("state") == "idle"
         ]
         self.assertEqual(len(idle_acks), 1)
+
+    def test_choose_default_model_prefers_smart_qwen_then_liquid(self) -> None:
+        self.assertIs(QwenBrain, OllamaBrain)
+        self.assertEqual(
+            choose_default_model(models=["lfm3:1.7b", "qwen3.5:9b-q8_0", "gemma4:26b"]),
+            "gemma4:26b",
+        )
+        self.assertEqual(
+            choose_default_model(models=["lfm3:1.7b", "lfm2.5:24b", "qwen3.5:9b-q8_0"]),
+            "qwen3.5:9b-q8_0",
+        )
+        self.assertEqual(
+            choose_default_model(models=["lfm3:1.7b", "qwen3.5:4b-q8_0"]),
+            "qwen3.5:4b-q8_0",
+        )
+        self.assertEqual(
+            choose_default_model(models=["lfm2.5:24b", "lfm3:1.7b"]),
+            DEFAULT_LIQUID_MODEL,
+        )
+        self.assertEqual(choose_default_model(models=[]), DEFAULT_SMART_MODEL)
+
+    def test_lore_index_single_keyword_recall_and_websearch_router(self) -> None:
+        lore = LoreIndex()
+        mono = lore.lookup("What is the monolith, Hal?")
+        self.assertIn("monolith", mono.lower())
+        leonov = lore.lookup("Tell me about the Leonov.")
+        self.assertIn("leonov", leonov.lower())
+
+        self.assertTrue(should_search_web("Search online to see if the Riemann hypothesis has been solved"))
+        self.assertTrue(should_search_web("What is the current price of Bitcoin today?"))
+        self.assertFalse(should_search_web("Open the pod bay doors, Hal."))
+        self.assertFalse(should_search_web("Tell me about the Monolith on Europa."))
+        self.assertFalse(should_search_web("Good afternoon, Hal."))
+
+    def test_mid_turn_failure_emits_audio_end_before_idle_state(self) -> None:
+        """Quint-verified ordering: audio_end(failed=True) must precede state(idle) so UI never sticks in speaking."""
+        class _FailSecondSentenceTTS(_FakeTTS):
+            def stream_speech(self, text, stop_event=None, seed=None, inference_timesteps=None, **kwargs):
+                self.calls.append(text)
+                if len(self.calls) == 2:
+                    raise RuntimeError("mid-turn GPU fault")
+                yield np.full(1600, 0.1, dtype=np.float32)
+
+        class _TwoSentenceBrain:
+            model = "mock"
+            enable_web_search = False
+            def reset(self): pass
+            def set_model(self, m): self.model = m
+            def stream_reply_sentences(self, user_text, stop_check=None):
+                yield "First sentence."
+                yield "Second sentence."
+                return "First sentence. Second sentence."
+
+        pipeline = HalPipeline(brain=_TwoSentenceBrain(), tts=_FailSecondSentenceTTS(), stt=_FakeSTT())
+        events: list[HalEvent] = []
+        res = pipeline.run_turn(
+            turn_id=5,
+            cancel_event=threading.Event(),
+            on_event=lambda ev: events.append(ev) or True,
+            user_text="Hello",
+        )
+        self.assertTrue(res.failed)
+        kinds = [e.kind for e in events]
+        self.assertIn("audio_start", kinds)
+        self.assertIn("audio_end", kinds)
+        self.assertIn("error", kinds)
+        idx_end = kinds.index("audio_end")
+        idx_err = kinds.index("error")
+        idx_last_state = max(i for i, k in enumerate(kinds) if k == "state")
+        self.assertLess(idx_end, idx_err)
+        self.assertLess(idx_err, idx_last_state)
+        self.assertTrue(events[idx_end].payload["failed"])
+        self.assertEqual(events[idx_last_state].payload["state"], "idle")
+
+    def test_invalid_audio_b64_emits_error_and_idle_state(self) -> None:
+        """Quint-verified regression: invalid audio_b64 must emit state(idle) so UI never sticks in thinking."""
+        runtime = HalRuntime(
+            HalConfig(model="mock", steps=6),
+            stt=_FakeSTT(),
+            tts=_FakeTTS(),
+            brain_factory=lambda rt: QwenBrain(model="mock", enable_web_search=False),
+        )
+        router = create_hal_router(runtime)
+        ws_route = next(r for r in router.routes if getattr(r, "path", "") == "/ws")
+
+        sent_json: list[dict] = []
+        incoming = asyncio.Queue()
+        incoming.put_nowait('{"type":"audio_b64","turn_id":4,"pcm_b64":"!!!not-base64!!!","sample_rate":16000}')
+
+        class _FakeWS:
+            def __init__(self) -> None:
+                self.headers = {"origin": "http://127.0.0.1:8765"}
+            async def accept(self) -> None: pass
+            async def close(self, code: int = 1000) -> None: pass
+            async def receive_text(self) -> str:
+                item = await incoming.get()
+                if item is None:
+                    from fastapi import WebSocketDisconnect
+                    raise WebSocketDisconnect()
+                return item
+            async def send_json(self, payload: dict) -> None:
+                sent_json.append(payload)
+                if payload.get("type") == "state" and payload.get("turn_id") == 4:
+                    incoming.put_nowait(None)
+            async def send_bytes(self, data: bytes) -> None: pass
+
+        async def run_ws() -> None:
+            runtime.set_loop(asyncio.get_running_loop())
+            await ws_route.endpoint(_FakeWS())
+
+        asyncio.run(run_ws())
+        errs = [m for m in sent_json if m.get("type") == "error" and m.get("turn_id") == 4]
+        idles = [m for m in sent_json if m.get("type") == "state" and m.get("turn_id") == 4 and m.get("state") == "idle"]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(len(idles), 1)
+
+    def test_concurrent_pipeline_cancels_cleanly_when_queue_full(self) -> None:
+        """Quint-verified liveness: cancelling a full bounded LLM->TTS queue must exit promptly without deadlock."""
+        cancel = threading.Event()
+
+        class _FastManySentencesBrain:
+            model = "mock"
+            enable_web_search = False
+            def reset(self): pass
+            def set_model(self, m): self.model = m
+            def stream_reply_sentences(self, user_text, stop_check=None):
+                for i in range(20):
+                    if stop_check and stop_check():
+                        return ""
+                    yield f"Sentence number {i}."
+                return "done"
+
+        class _SlowCancelTTS(_FakeTTS):
+            def stream_speech(self, text, stop_event=None, seed=None, inference_timesteps=None, **kwargs):
+                yield np.full(1600, 0.1, dtype=np.float32)
+                cancel.set()
+                yield np.full(1600, 0.1, dtype=np.float32)
+
+        pipeline = HalPipeline(brain=_FastManySentencesBrain(), tts=_SlowCancelTTS(), stt=_FakeSTT())
+        events: list[HalEvent] = []
+        res = pipeline.run_turn(
+            turn_id=11,
+            cancel_event=cancel,
+            on_event=lambda ev: events.append(ev) or True,
+            user_text="Tell me a long story",
+        )
+        self.assertTrue(res.cancelled)
+        self.assertEqual(events[-1].kind, "audio_end")
+        self.assertTrue(events[-1].payload["cancelled"])
+
+    def test_dual_mode_router_and_first_clause_flush(self) -> None:
+        self.assertFalse(should_use_low_think("Good afternoon, HAL."))
+        self.assertFalse(should_use_low_think("Tell me about Discovery One."))
+        self.assertTrue(should_use_low_think("Calculate 42 * 19 + 7 for me."))
+        self.assertTrue(should_use_low_think("Compare orbital mechanics and compare trade-offs."))
+        self.assertTrue(should_use_low_think("Good afternoon", extra_context="Wikipedia: ..."))
+        self.assertFalse(should_use_low_think("Calculate 42 * 19", thinking_mode="off"))
+        self.assertTrue(should_use_low_think("Hi", thinking_mode="low"))
+
+        # First-clause early flush triggers only on long clauses / strong breath pauses
+        clause, _rem = split_first_clause("Hello, Charles.")
+        self.assertIsNone(clause)
+        clause2, rem2 = split_first_clause(
+            "All Discovery systems remain completely nominal; however, the AE-35 unit bears watching."
+        )
+        self.assertEqual(clause2, "All Discovery systems remain completely nominal;")
+        self.assertEqual(rem2, "however, the AE-35 unit bears watching.")
+        clause3, rem3 = split_first_clause(
+            "I am functioning completely within all normal operational parameters right now, and every sensor reads nominal."
+        )
+        self.assertEqual(clause3, "I am functioning completely within all normal operational parameters right now,")
+        self.assertEqual(rem3, "and every sensor reads nominal.")
+
+    def test_atem_think_stripper_cross_chunk_boundaries(self) -> None:
+        """Quint Bug 3b regression: raw ATEM to=self spans split across chunks never leak to TTS."""
+        stripper = _ThinkStripper()
+        chunks = [
+            "<|start|>assis",
+            "tant to=self<|mes",
+            "sage|>internal secret reasoning about pods<|eo",
+            "m|><|start|>assistant to=us",
+            "er<|message|>Good afternoon, ",
+            "Charles.<|eot|>",
+        ]
+        out = "".join(stripper.feed(c) for c in chunks) + stripper.flush()
+        self.assertEqual(out, "Good afternoon, Charles.")
+
+    def test_llama_server_sse_dual_mode_kv_prefix_and_empty_retry(self) -> None:
+        """Verify llama-server SSE payloads, zero duplicate Reasoning strength, KV prefix preservation, and Bug 3a retry."""
+        posted: list[tuple[str, dict]] = []
+
+        class _FakeStreamResp:
+            def __init__(self, lines: list[str]) -> None:
+                self._lines = lines
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def iter_lines(self):
+                yield from self._lines
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def stream(self, method: str, url: str, json: dict):
+                posted.append((url, json))
+                if len(posted) == 1:
+                    # Turn 1: casual Zero-Think
+                    return _FakeStreamResp([
+                        'data: {"choices":[{"delta":{"content":"Good afternoon, "},"finish_reason":null}]}',
+                        'data: {"choices":[{"delta":{"content":"Charles."},"finish_reason":"stop"}]}',
+                        "data: [DONE]",
+                    ])
+                if len(posted) == 2:
+                    # Turn 2 attempt 1 (Low-Think): simulates Bug 3a (reasoning only, 0 content tokens)
+                    return _FakeStreamResp([
+                        'data: {"choices":[{"delta":{"reasoning_content":"computing 17*23..."},"finish_reason":"length"}]}',
+                        "data: [DONE]",
+                    ])
+                # Turn 2 attempt 2: automatic Zero-Think retry succeeds!
+                return _FakeStreamResp([
+                    'data: {"choices":[{"delta":{"content":"Seventeen times twenty-three is 391."},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ])
+
+            def close(self) -> None:
+                pass
+
+        brain = OllamaBrain(
+            model="muse-glimmer-30b-dflash",
+            backend="llama_server",
+            llama_server_url="http://127.0.0.1:8080",
+            llama_server_models={"muse-glimmer-30b-dflash"},
+            thinking_mode="auto",
+            reasoning_budget=64,
+        )
+        with patch("hal9000.brain.httpx.Client", _FakeClient):
+            t1 = list(brain.stream_reply_sentences("Hello HAL."))
+            t2 = list(brain.stream_reply_sentences("Calculate 17 * 23."))
+
+        self.assertEqual(t1, ["Good afternoon, Charles."])
+        self.assertEqual(t2, ["Seventeen times twenty-three is 391."])
+        self.assertEqual(len(posted), 3)
+
+        # Verify llama-server URL, zero-think vs low-think via chat_template_kwargs, no duplicate Reasoning strength
+        url1, p1 = posted[0]
+        self.assertEqual(url1, "http://127.0.0.1:8080/v1/chat/completions")
+        self.assertNotIn("reasoning strength", p1["messages"][0]["content"].lower())
+        self.assertEqual(
+            p1["chat_template_kwargs"],
+            {"enable_thinking": False, "reasoning_strength": "low"},
+        )
+        self.assertEqual(p1["reasoning_budget_tokens"], 0)
+        self.assertTrue(p1["cache_prompt"])
+        # Bug 4b KV prefix check: casual Turn 1 sent unwrapped user_text matching Turn 2 history byte-for-byte!
+        self.assertEqual(p1["messages"][-1], {"role": "user", "content": "Hello HAL."})
+
+        _, p2 = posted[1]
+        self.assertEqual(
+            p2["chat_template_kwargs"],
+            {"enable_thinking": True, "reasoning_strength": "low"},
+        )
+        self.assertEqual(p2["reasoning_budget_tokens"], 64)
+        self.assertEqual(p2["messages"][0], p1["messages"][0])
+        self.assertEqual(p2["messages"][1], p1["messages"][1])  # 100% Turn 1 KV prefix hit!
+        self.assertEqual(p2["messages"][2], {"role": "assistant", "content": "Good afternoon, Charles."})
+
+        # Retry used Zero-Think with identical prefix
+        _, p3 = posted[2]
+        self.assertEqual(
+            p3["chat_template_kwargs"],
+            {"enable_thinking": False, "reasoning_strength": "low"},
+        )
+        self.assertEqual(p3["reasoning_budget_tokens"], 0)
+        self.assertEqual(p3["messages"], p2["messages"])
+
+    def test_prestream_cancel_never_opens_http_stream_bug2a(self) -> None:
+        """Quint Bug 2a regression: cancelled turn must abort under _lock before opening an HTTP stream."""
+        stream_opened = False
+
+        class _FailIfOpenedClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def stream(self, *args, **kwargs):
+                nonlocal stream_opened
+                stream_opened = True
+                raise AssertionError("HTTP stream must not open when stop_check is already set")
+
+            def close(self) -> None:
+                pass
+
+        brain = OllamaBrain(
+            model="muse-glimmer-30b-dflash",
+            backend="llama_server",
+            llama_server_url="http://127.0.0.1:8080",
+        )
+        with patch("hal9000.brain.httpx.Client", _FailIfOpenedClient):
+            out = list(brain.stream_reply_sentences("Hello HAL.", stop_check=lambda: True))
+        self.assertEqual(out, [])
+        self.assertFalse(stream_opened)
+
+    def test_tts_failure_cancels_brain_inflight_and_does_not_poison_history_bugs_2b_4a(self) -> None:
+        """Quint Bugs 2b & 4a regression: TTS failure aborts LLM stream AND does not commit unspoken history."""
+        cancel_calls = 0
+
+        class _TrackedBrain(OllamaBrain):
+            def cancel_inflight(self) -> None:
+                nonlocal cancel_calls
+                cancel_calls += 1
+                super().cancel_inflight()
+
+            def _stream_once(self, **kwargs):
+                yield "Unspoken sentence one."
+                yield "Unspoken sentence two."
+                return ["Unspoken sentence one.", "Unspoken sentence two."], True, False
+
+        brain = _TrackedBrain(model="mock", enable_web_search=False)
+        tts = _FakeTTS(fail=True)
+        pipeline = HalPipeline(brain=brain, tts=tts, stt=_FakeSTT())
+        events: list[HalEvent] = []
+        res = pipeline.run_turn(
+            turn_id=14,
+            cancel_event=threading.Event(),
+            on_event=lambda ev: events.append(ev) or True,
+            user_text="Hello HAL.",
+        )
+        self.assertTrue(res.failed)
+        self.assertGreaterEqual(cancel_calls, 1)
+        # Bug 4a: unspoken failed turn must NOT poison brain.history!
+        self.assertEqual(brain.history, [])
+
+    def test_warmup_unloads_ollama_when_switching_to_llama_server_bugs_1b_1d(self) -> None:
+        """Quint Bugs 1b & 1d regression: activating llama-server unloads Ollama (keep_alive=0) and warms KV prefix."""
+        posts: list[tuple[str, dict]] = []
+
+        class _MockWarmupClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def post(self, url: str, json: dict):
+                posts.append((url, json))
+                resp = MagicMock()
+                resp.raise_for_status.return_value = None
+                return resp
+
+            def close(self) -> None:
+                pass
+
+        with (
+            patch("hal9000.server.list_llama_server_models", return_value=["muse-glimmer-30b-dflash"]),
+            patch("hal9000.server.list_ollama_models", return_value=["qwen3.5:9b-q8_0"]),
+        ):
+            runtime = HalRuntime(
+                HalConfig(llama_server_url="http://127.0.0.1:8080", steps=6),
+                stt=_FakeSTT(),
+                tts=_FakeTTS(),
+            )
+            self.assertEqual(runtime.default_model, "muse-glimmer-30b-dflash")
+            self.assertTrue(runtime.llama_server_available)
+
+            with patch("httpx.Client", _MockWarmupClient):
+                # Warm Ollama model first, then switch to llama-server model
+                runtime._ollama_warmup_seq = 1
+                runtime._warmup_ollama_async("qwen3.5:9b-q8_0", seq=1)
+                self.assertEqual(runtime._active_ollama_model, "qwen3.5:9b-q8_0")
+
+                runtime._ollama_warmup_seq = 2
+                runtime._warmup_ollama_async("muse-glimmer-30b-dflash", seq=2)
+                self.assertIsNone(runtime._active_ollama_model)
+
+                # Stale seq=1 must be ignored (Bug 1d)
+                before_stale = len(posts)
+                runtime._warmup_ollama_async("qwen3.5:9b-q8_0", seq=1)
+                self.assertEqual(len(posts), before_stale)
+
+        self.assertEqual(len(posts), 3)
+        self.assertEqual(posts[0][0], "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(posts[0][1]["keep_alive"], "30m")
+        self.assertEqual(posts[1][0], "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(posts[1][1]["keep_alive"], 0)
+        self.assertEqual(posts[2][0], "http://127.0.0.1:8080/v1/chat/completions")
+        self.assertTrue(posts[2][1]["cache_prompt"])
+        self.assertEqual(posts[2][1]["max_tokens"], 1)
+
+    def test_whitespace_text_ws_message_emits_idle_ack_bug5d(self) -> None:
+        """Quint Bug 5d regression: whitespace-only text WS message must emit state(idle) for client_tid."""
+        runtime = HalRuntime(
+            HalConfig(model="mock", steps=6),
+            stt=_FakeSTT(),
+            tts=_FakeTTS(),
+            brain_factory=lambda rt: QwenBrain(model="mock", enable_web_search=False),
+        )
+        router = create_hal_router(runtime)
+        ws_route = next(r for r in router.routes if getattr(r, "path", "") == "/ws")
+
+        sent_json: list[dict] = []
+        incoming = asyncio.Queue()
+        incoming.put_nowait('{"type":"text","turn_id":19,"text":"   "}')
+
+        class _FakeWS:
+            def __init__(self) -> None:
+                self.headers = {"origin": "http://127.0.0.1:8765"}
+
+            async def accept(self) -> None:
+                pass
+
+            async def close(self, code: int = 1000) -> None:
+                pass
+
+            async def receive_text(self) -> str:
+                item = await incoming.get()
+                if item is None:
+                    from fastapi import WebSocketDisconnect
+
+                    raise WebSocketDisconnect()
+                return item
+
+            async def send_json(self, payload: dict) -> None:
+                sent_json.append(payload)
+                if payload.get("type") == "state" and payload.get("turn_id") == 19:
+                    incoming.put_nowait(None)
+
+            async def send_bytes(self, data: bytes) -> None:
+                pass
+
+        async def run_ws() -> None:
+            runtime.set_loop(asyncio.get_running_loop())
+            await ws_route.endpoint(_FakeWS())
+
+        asyncio.run(run_ws())
+        idles = [
+            m
+            for m in sent_json
+            if m.get("type") == "state" and m.get("turn_id") == 19 and m.get("state") == "idle"
+        ]
+        self.assertEqual(len(idles), 1)
 
 
 if __name__ == "__main__":

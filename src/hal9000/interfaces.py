@@ -119,6 +119,10 @@ class HalConfig:
 
     model: str | None = None
     ollama_url: str = "http://127.0.0.1:11434"
+    llm_backend: Literal["auto", "ollama", "llama_server"] = "auto"
+    llama_server_url: str | None = None
+    thinking_mode: Literal["auto", "off", "low"] = "auto"
+    reasoning_budget: int = 64
     ref_wav: Path | None = None
     ref_text: str | None = None
     steps: int = 6

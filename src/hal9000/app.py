@@ -1,4 +1,4 @@
-"""HAL 9000 Push-to-Talk Desktop & CLI Application (VoxCPM2 + Qwen + Whisper)."""
+"""HAL 9000 Push-to-Talk Desktop & CLI Application (VoxCPM2 + Liquid + Whisper)."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import numpy as np
 import sounddevice as sd
 
 from .audio import MicRecorder, StreamingAudioPlayer
-from .brain import QwenBrain, choose_default_qwen_model, list_ollama_models
+from .brain import OllamaBrain, choose_default_model, list_ollama_models
 from .stt import WhisperSTT
 from .tts import MIN_DIFFUSION_STEPS, HalVoiceEngine, resolve_reference_wav
 
@@ -31,7 +31,7 @@ def run_cli_mode(
 ) -> None:
     """Minimal terminal Push-to-Talk (Enter to start/stop) fallback."""
     print("[IOGHAL] Initializing neural subsystems...")
-    brain = QwenBrain(model=model, base_url=ollama_url)
+    brain = OllamaBrain(model=model, base_url=ollama_url)
     stt = WhisperSTT()
     tts = HalVoiceEngine(
         reference_wav=resolve_reference_wav(ref_wav),
@@ -262,7 +262,7 @@ def run_gui_mode(
     class HalMainWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
-            self.setWindowTitle("HAL 9000 — VoxCPM2 + Qwen PTT")
+            self.setWindowTitle("HAL 9000 — VoxCPM2 + Liquid PTT")
             self.resize(520, 740)
             self.setMinimumSize(440, 620)
             self.setStyleSheet(
@@ -347,8 +347,8 @@ def run_gui_mode(
             self.signals.metrics.connect(self._on_metrics)
 
             discovered_models = list_ollama_models(ollama_url)
-            chosen_model = model or choose_default_qwen_model(ollama_url, models=discovered_models)
-            self.brain = QwenBrain(model=chosen_model, base_url=ollama_url)
+            chosen_model = model or choose_default_model(ollama_url, models=discovered_models)
+            self.brain = OllamaBrain(model=chosen_model, base_url=ollama_url)
             self.stt: WhisperSTT | None = None
             self.tts: HalVoiceEngine | None = None
             self.mic = MicRecorder(
@@ -720,12 +720,12 @@ def run_gui_mode(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="IOGHAL Push-to-Talk Desktop & CLI Voice Assistant (VoxCPM2 + Qwen + Whisper)"
+        description="IOGHAL Push-to-Talk Desktop & CLI Voice Assistant (VoxCPM2 + Liquid + Whisper)"
     )
     parser.add_argument(
         "--model",
         default=None,
-        help="Ollama Qwen model name (default: auto-selects qwen3.5:9b-q8_0)",
+        help="Ollama model name (default: auto-selects lfm3:1.7b)",
     )
     parser.add_argument(
         "--ref-wav",

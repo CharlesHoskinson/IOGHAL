@@ -19,6 +19,11 @@ voices/*.mp3
 voices/*.flac
 voices/*.txt
 voices/raw/
+voices/corpus/
+voices/hal9000_lora/
+voices/hal9000_lora_exp/
+voices/hal9000_lora_run/
+voices/hal9000_ref.orig.*
 outputs/
 lore/raw/
 lore/hal9000_movie_lines.md

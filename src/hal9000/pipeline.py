@@ -1,8 +1,10 @@
-"""Transport-agnostic voice turn pipeline for embedding IOGHAL into host apps."""
+"""Transport-agnostic concurrent voice turn pipeline (STT -> Search -> LLM || TTS)."""
 
 from __future__ import annotations
 
+import inspect
 import logging
+import queue
 import threading
 import time
 from collections.abc import Callable
@@ -10,18 +12,41 @@ from collections.abc import Callable
 import numpy as np
 
 from .interfaces import BrainProvider, HalEvent, STTProvider, TTSProvider, TurnResult
+from .websearch import search_web_context, should_search_web
 
 logger = logging.getLogger(__name__)
 
 EventSink = Callable[[HalEvent], bool | None]
+_SENTENCE_QUEUE_MAX = 4
+
+
+def _brain_accepts_param(brain: BrainProvider, name: str) -> bool:
+    try:
+        sig = inspect.signature(brain.stream_reply_sentences)
+        return name in sig.parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _brain_accepts_extra_context(brain: BrainProvider) -> bool:
+    return _brain_accepts_param(brain, "extra_context")
+
+
+def _cancel_brain_inflight(brain: BrainProvider) -> None:
+    cancel_fn = getattr(brain, "cancel_inflight", None)
+    if callable(cancel_fn):
+        try:
+            cancel_fn()
+        except Exception:
+            logger.debug("Brain cancel_inflight hook failed", exc_info=True)
 
 
 class HalPipeline:
-    """Coordinates STT -> Brain -> streaming TTS for a single turn with cancel support.
+    """Coordinates STT -> optional live web search -> concurrent LLM || streaming TTS.
 
-    Host applications can instantiate ``HalPipeline`` directly with custom
-    ``STTProvider``, ``BrainProvider``, and ``TTSProvider`` implementations
-    without depending on FastAPI, WebSockets, or PyQt6.
+    LLM sentence generation runs on a producer thread feeding a bounded queue while the
+    consumer thread synthesizes audio under ``gpu_lock``, eliminating inter-sentence LLM
+    stalls while maintaining Quint-verified cancellation and strict audio framing.
     """
 
     def __init__(
@@ -51,7 +76,9 @@ class HalPipeline:
         result = TurnResult(turn_id=turn_id)
         completed_sentences: list[str] = []
         audio_started = False
+        audio_ended = False
         terminal_state_sent = False
+        producer_thread: threading.Thread | None = None
 
         def emit(kind: str, payload: dict | None = None, pcm: np.ndarray | None = None) -> bool:
             ev = HalEvent(kind=kind, turn_id=turn_id, payload=payload or {}, pcm=pcm)  # type: ignore[arg-type]
@@ -96,18 +123,110 @@ class HalPipeline:
 
             result.user_text = user_text
             emit("transcript", {"speaker": "YOU", "text": user_text})
+
+            # Optional non-fatal live web search stage for current/encyclopedic queries
+            web_context = ""
+            if (
+                getattr(self.brain, "enable_web_search", False)
+                and _brain_accepts_extra_context(self.brain)
+                and should_search_web(user_text)
+            ):
+                emit("state", {"state": "thinking", "detail": "SEARCHING ARCHIVES..."})
+                t_web = time.perf_counter()
+                try:
+                    web_context = search_web_context(
+                        user_text, cancel_event=cancel_event, timeout_s=3.5
+                    )
+                except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
+                    logger.debug("Turn %d web search fallback: %s", turn_id, exc)
+                    web_context = ""
+                if cancel_event.is_set():
+                    result.cancelled = True
+                    return result
+                if web_context:
+                    logger.info(
+                        "Turn %d web context fetched (%d chars in %.2fs)",
+                        turn_id,
+                        len(web_context),
+                        time.perf_counter() - t_web,
+                    )
+
+            model_label = (
+                self.brain.get_model()
+                if hasattr(self.brain, "get_model")
+                else self.brain.model
+            )
             emit(
                 "state",
-                {"state": "thinking", "detail": f"PROCESSING ({self.brain.model})..."},
+                {"state": "thinking", "detail": f"PROCESSING ({model_label})..."},
             )
 
             t_start = time.perf_counter()
             emitted_samples = 0
             gen_elapsed = 0.0
 
-            for sentence in self.brain.stream_reply_sentences(
-                user_text, stop_check=cancel_event.is_set
-            ):
+            # Quint Bug 4a fix: defer history commit until TTS actually speaks completed_sentences
+            defer_commit = (
+                _brain_accepts_param(self.brain, "auto_commit")
+                and callable(getattr(self.brain, "get_history_gen", None))
+                and callable(getattr(self.brain, "commit_turn", None))
+            )
+            turn_history_gen: int | None = (
+                self.brain.get_history_gen() if defer_commit else None  # type: ignore[attr-defined]
+            )
+
+            # Producer-consumer bounded queue overlapping LLM generation with VoxCPM2 TTS
+            sentence_q: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=_SENTENCE_QUEUE_MAX)
+
+            def _put_with_cancel(item: tuple[str, object]) -> bool:
+                while not cancel_event.is_set():
+                    try:
+                        sentence_q.put(item, timeout=0.05)
+                        return True
+                    except queue.Full:
+                        continue
+                return False
+
+            def _llm_producer() -> None:
+                try:
+                    kwargs: dict = {"stop_check": cancel_event.is_set}
+                    if web_context and _brain_accepts_extra_context(self.brain):
+                        kwargs["extra_context"] = web_context
+                    if defer_commit:
+                        kwargs["auto_commit"] = False
+                    for sentence in self.brain.stream_reply_sentences(user_text, **kwargs):
+                        if cancel_event.is_set():
+                            return
+                        if not _put_with_cancel(("sentence", sentence)):
+                            return
+                    _put_with_cancel(("done", None))
+                except Exception as exc:  # noqa: BLE001
+                    if not cancel_event.is_set():
+                        _put_with_cancel(("error", exc))
+
+            producer_thread = threading.Thread(
+                target=_llm_producer, name=f"hal-llm-{turn_id}", daemon=True
+            )
+            producer_thread.start()
+
+            while True:
+                if cancel_event.is_set():
+                    result.cancelled = True
+                    break
+                try:
+                    kind, payload = sentence_q.get(timeout=0.05)
+                except queue.Empty:
+                    if not producer_thread.is_alive():
+                        break
+                    continue
+
+                if kind == "done":
+                    break
+                if kind == "error":
+                    assert isinstance(payload, Exception)
+                    raise payload
+
+                sentence = str(payload)
                 if cancel_event.is_set():
                     result.cancelled = True
                     break
@@ -176,6 +295,22 @@ class HalPipeline:
             result.generation_seconds = gen_elapsed
             result.reply_text = " ".join(completed_sentences)
 
+            # Commit spoken history only after TTS finishes cleanly without cancel or failure
+            if (
+                defer_commit
+                and turn_history_gen is not None
+                and result.reply_text
+                and not result.cancelled
+                and not result.failed
+                and not cancel_event.is_set()
+            ):
+                self.brain.commit_turn(  # type: ignore[attr-defined]
+                    turn_history_gen,
+                    user_text,
+                    result.reply_text,
+                    stop_check=cancel_event.is_set,
+                )
+
             if audio_started and result.audio_seconds > 0 and gen_elapsed > 0:
                 rtf = gen_elapsed / result.audio_seconds
                 emit(
@@ -188,15 +323,35 @@ class HalPipeline:
                 )
         except Exception as exc:
             logger.exception("Turn %d failed", turn_id)
+            cancel_event.set()
+            _cancel_brain_inflight(self.brain)
             result.failed = True
             result.error = str(exc)
             terminal_state_sent = True
+            # Quint-proven strict framing: emit audio_end(failed=True) FIRST so the open audio
+            # stream closes cleanly before error and state(idle) arrive on the client.
+            if audio_started and not audio_ended:
+                audio_ended = True
+                emit(
+                    "audio_end",
+                    {
+                        "text": " ".join(completed_sentences),
+                        "cancelled": False,
+                        "failed": True,
+                    },
+                )
             emit("error", {"message": str(exc)})
             emit("state", {"state": "idle", "detail": f"TURN ERROR: {exc}"})
         finally:
-            if cancel_event.is_set():
+            if cancel_event.is_set() and not result.failed:
                 result.cancelled = True
-            if audio_started:
+            if producer_thread is not None and producer_thread.is_alive():
+                cancel_event.set()
+                # Quint Bug 2b fix: abort any open LLM HTTP stream immediately to release --parallel 1 slot
+                _cancel_brain_inflight(self.brain)
+                producer_thread.join(timeout=1.0)
+            if audio_started and not audio_ended:
+                audio_ended = True
                 emit(
                     "audio_end",
                     {
@@ -205,7 +360,7 @@ class HalPipeline:
                         "failed": result.failed,
                     },
                 )
-            elif not terminal_state_sent and not result.cancelled:
+            elif not terminal_state_sent and not result.cancelled and not result.failed:
                 emit(
                     "state",
                     {
