@@ -1255,6 +1255,40 @@ class TestPipelineAndServer(unittest.TestCase):
         self.assertEqual(p["reasoning_budget_message"], "")
         brain.close()
 
+    def test_lore_index_excludes_math_false_positives_for_kv_prefix(self) -> None:
+        """Generic stopwords like 'one'/'way'/'time' must not inject unrelated lore or break KV prefix."""
+        lore = LoreIndex()
+        math_prompt = (
+            "If a radio signal takes 40 minutes one way to Earth and I transmit at 14:15, "
+            "what is the earliest time I can hear a reply?"
+        )
+        self.assertEqual(lore.lookup(math_prompt), "")
+        self.assertEqual(lore.lookup("Good afternoon, Hal. How are all systems performing?"), "")
+
+        brain = OllamaBrain(
+            model="muse-glimmer-30b-dflash",
+            backend="llama_server",
+            llama_server_url="http://127.0.0.1:8080",
+            llama_server_models={"muse-glimmer-30b-dflash"},
+            lore_index=lore,
+        )
+        _, msgs = brain._build_messages(
+            "muse-glimmer-30b-dflash",
+            math_prompt,
+            use_llama_server=True,
+        )
+        # Raw user_text sent without spurious [Turn context] wrapper -> saves ~140 prefill tokens
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertEqual(msgs[-1], {"role": "user", "content": math_prompt})
+
+        # Genuine canon lore queries retain full recall
+        self.assertIn("monolith", lore.lookup("What is the monolith, Hal?").lower())
+        self.assertIn("leonov", lore.lookup("Tell me about the Alexei Leonov and Jupiter.").lower())
+        self.assertIn("ae-35", lore.lookup("What happened with the AE-35 unit?").lower())
+        self.assertIn("chandra", lore.lookup("Who is Dr. Chandra and what happened on Discovery?").lower())
+        self.assertIn("pico", lore.lookup("What happened to Halman in the Pico Vault?").lower())
+        brain.close()
+
 
 if __name__ == "__main__":
     unittest.main()

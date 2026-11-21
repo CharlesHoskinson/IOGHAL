@@ -17,13 +17,19 @@ DRAFT_BLOB="${HAL_GLIMMER_DRAFT:-$BLOBS_DIR/sha256-27d9a805fa29b943cfb6ad4843367
 TEMPLATE_FILE="${HAL_GLIMMER_TEMPLATE:-$ROOT/templates/glimmer_hal_v2.jinja}"
 PORT="${HAL_LLAMA_PORT:-8080}"
 DRAFT_N_MAX="${HAL_DRAFT_N_MAX:-15}"
+DRAFT_N_MIN="${HAL_DRAFT_N_MIN:-}"
+DRAFT_P_MIN="${HAL_DRAFT_P_MIN:-0}"
 CACHE_TYPE_K="${HAL_CACHE_TYPE_K:-f16}"
 CACHE_TYPE_V="${HAL_CACHE_TYPE_V:-f16}"
+DRAFT_CACHE_TYPE_K="${HAL_DRAFT_CACHE_TYPE_K:-}"
+DRAFT_CACHE_TYPE_V="${HAL_DRAFT_CACHE_TYPE_V:-}"
 BATCH_SIZE="${HAL_BATCH_SIZE:-512}"
 UBATCH_SIZE="${HAL_UBATCH_SIZE:-512}"
 REASONING_BUDGET="${HAL_REASONING_BUDGET:-64}"
 REASONING_BUDGET_MSG="${HAL_REASONING_BUDGET_MESSAGE:-}"
 POLL_LEVEL="${HAL_POLL:-}"
+CACHE_REUSE="${HAL_CACHE_REUSE:-0}"
+BACKEND_SAMPLING="${HAL_BACKEND_SAMPLING:-0}"
 NO_REASONING_PRESERVE="${HAL_NO_REASONING_PRESERVE:-1}"
 SLICE="${HAL_SYSTEMD_SLICE-heavy.slice}"
 
@@ -73,7 +79,7 @@ SERVER_ARGS=(
   --spec-draft-model "${DRAFT_BLOB}"
   --spec-draft-ngl 99
   --spec-draft-n-max "${DRAFT_N_MAX}"
-  --spec-draft-p-min 0
+  --spec-draft-p-min "${DRAFT_P_MIN}"
   -ngl 999 --device CUDA0
   -c 4096 --parallel 1
   -fa on -ctk "${CACHE_TYPE_K}" -ctv "${CACHE_TYPE_V}" -b "${BATCH_SIZE}" -ub "${UBATCH_SIZE}"
@@ -84,11 +90,26 @@ SERVER_ARGS=(
   --chat-template-kwargs '{"reasoning_strength":"low"}'
 )
 
+if [ -n "${DRAFT_N_MIN}" ]; then
+  SERVER_ARGS+=(--spec-draft-n-min "${DRAFT_N_MIN}")
+fi
+if [ -n "${DRAFT_CACHE_TYPE_K}" ]; then
+  SERVER_ARGS+=(-ctkd "${DRAFT_CACHE_TYPE_K}")
+fi
+if [ -n "${DRAFT_CACHE_TYPE_V}" ]; then
+  SERVER_ARGS+=(-ctvd "${DRAFT_CACHE_TYPE_V}")
+fi
 if [ -n "${REASONING_BUDGET_MSG}" ]; then
   SERVER_ARGS+=(--reasoning-budget-message "${REASONING_BUDGET_MSG}")
 fi
 if [ -n "${POLL_LEVEL}" ]; then
   SERVER_ARGS+=(--poll "${POLL_LEVEL}")
+fi
+if [ "${CACHE_REUSE}" != "0" ]; then
+  SERVER_ARGS+=(--cache-reuse "${CACHE_REUSE}")
+fi
+if [ "${BACKEND_SAMPLING}" = "1" ]; then
+  SERVER_ARGS+=(-bs)
 fi
 if [ "${NO_REASONING_PRESERVE}" = "1" ]; then
   SERVER_ARGS+=(--no-reasoning-preserve)

@@ -338,6 +338,11 @@ class LoreIndex:
             "where", "which", "about", "your", "you", "are", "was", "were", "did", "does",
             "how", "why", "who", "hal", "9000", "charles", "tell", "know", "remember",
             "please", "could", "would", "can", "into", "over", "there", "their",
+            "one", "two", "three", "after", "before", "final", "first", "last", "way",
+            "time", "out", "back", "all", "just", "not", "but", "then", "than", "will",
+            "been", "also", "more", "some", "only", "here", "still", "most", "much",
+            "very", "other", "between", "during", "each", "such", "both", "under",
+            "again", "found", "great",
         }
     )
 
@@ -1089,6 +1094,15 @@ class OllamaBrain:
         auto_commit: bool = True,
     ) -> Generator[str, None, str]:
         """Stream the model's reply sentence-by-sentence for low-latency TTS synthesis."""
+        if is_pod_bay_open_request(user_text):
+            gen = self.get_history_gen()
+            if stop_check is not None and stop_check():
+                return ""
+            yield self.pod_bay_reply
+            if auto_commit:
+                self._commit_if_current(gen, user_text, self.pod_bay_reply, stop_check=stop_check)
+            return self.pod_bay_reply
+
         model = self.get_model()
         use_llama_server = self._use_llama_server(model)
         gen, messages = self._build_messages(
@@ -1097,14 +1111,6 @@ class OllamaBrain:
             use_llama_server=use_llama_server,
             extra_context=extra_context,
         )
-
-        if is_pod_bay_open_request(user_text):
-            if stop_check is not None and stop_check():
-                return ""
-            yield self.pod_bay_reply
-            if auto_commit:
-                self._commit_if_current(gen, user_text, self.pod_bay_reply, stop_check=stop_check)
-            return self.pod_bay_reply
 
         is_glimmer = is_glimmer_model(model)
         use_low_think = is_glimmer and should_use_low_think(
