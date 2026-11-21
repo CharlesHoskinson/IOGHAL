@@ -47,7 +47,11 @@ export type ServerMessage =
   | { type: 'cleared'; turn_id?: number }
   | { type: 'error'; turn_id?: number; message?: string };
 
-const DEFAULT_PREBUFFER_SEC = 0.35;
+// VoxCPM2 streams ~160ms chunks at ~0.33x RTF (~53ms/chunk), so 150ms starts on chunk 1
+// with 3x headroom while widening automatically to 300ms if a genuine underrun occurs.
+const INITIAL_PREBUFFER_SEC = 0.15;
+const REBUFFER_PREBUFFER_SEC = 0.30;
+const SCHEDULE_LEAD_SEC = 0.015;
 const PCM_HEADER_BYTES = 4;
 
 /** Parse a binary WebSocket PCM frame prefixed with a 4-byte little-endian uint32 turn_id. */
@@ -210,10 +214,13 @@ export class HalAudioPlayer {
       return;
     }
 
+    const targetSec = this.underrunCount > 0 ? REBUFFER_PREBUFFER_SEC : INITIAL_PREBUFFER_SEC;
+    const targetSamples = Math.floor(this.sampleRate * targetSec);
+
     if (!this.playbackStarted) {
       this.prebuffer.push(pcm);
       this.prebufferSamples += pcm.length;
-      if (this.prebufferSamples >= Math.floor(this.sampleRate * DEFAULT_PREBUFFER_SEC)) {
+      if (this.prebufferSamples >= targetSamples) {
         this.flushPrebuffer();
       }
       return;
@@ -226,6 +233,9 @@ export class HalAudioPlayer {
       this.playbackStarted = false;
       this.prebuffer.push(pcm);
       this.prebufferSamples += pcm.length;
+      if (this.prebufferSamples >= Math.floor(this.sampleRate * REBUFFER_PREBUFFER_SEC)) {
+        this.flushPrebuffer();
+      }
       return;
     }
 
@@ -304,8 +314,8 @@ export class HalAudioPlayer {
     src.buffer = audioBuf;
     src.connect(gain);
 
-    // Preserve exact future cursor (no artificial gaps); add 25ms lead only when starting fresh/underrun
-    const startAt = hadGap ? now + 0.025 : this.nextPlayTime;
+    // Preserve exact future cursor (no artificial gaps); add 15ms lead only when starting fresh/underrun
+    const startAt = hadGap ? now + SCHEDULE_LEAD_SEC : this.nextPlayTime;
     this.nextPlayTime = startAt + audioBuf.duration;
 
     const myGen = this.playbackGen;

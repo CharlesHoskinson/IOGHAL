@@ -814,6 +814,129 @@ class TestPipelineAndServer(unittest.TestCase):
         ]
         self.assertEqual(len(idles), 1)
 
+    def test_websearch_immediate_cancel_closes_clients_without_linger(self) -> None:
+        """Quint QA Finding #5 regression: barge-in aborts websearch httpx.Clients without waiting on slow sockets."""
+        import time
+
+        from hal9000.websearch import clear_search_cache, search_web_context
+
+        clear_search_cache()
+        cancel_ev = threading.Event()
+        opened_clients: list[object] = []
+        closed_clients: list[object] = []
+
+        class _SlowBlockingClient:
+            def __init__(self, *args, **kwargs) -> None:
+                self._closed = threading.Event()
+                opened_clients.append(self)
+
+            def get(self, url: str, params=None):
+                self._closed.wait(timeout=3.0)
+                raise RuntimeError("client closed on cancel")
+
+            def close(self) -> None:
+                if not self._closed.is_set():
+                    self._closed.set()
+                    closed_clients.append(self)
+
+        def _trigger_cancel() -> None:
+            time.sleep(0.04)
+            cancel_ev.set()
+
+        t = threading.Thread(target=_trigger_cancel, daemon=True)
+        t.start()
+        t0 = time.perf_counter()
+        with patch("hal9000.websearch.httpx.Client", _SlowBlockingClient):
+            res = search_web_context(
+                "Search online for current Jupiter telemetry",
+                cancel_event=cancel_ev,
+                timeout_s=3.5,
+            )
+        elapsed = time.perf_counter() - t0
+        t.join(timeout=1.0)
+
+        self.assertEqual(res, "")
+        self.assertLess(elapsed, 0.45)
+        self.assertGreaterEqual(len(opened_clients), 1)
+        self.assertEqual(len(closed_clients), len(opened_clients))
+
+    def test_websearch_early_return_after_rich_wikipedia_and_ttl_cache(self) -> None:
+        """Rich Wikipedia hit caps DDG wait to grace window, aborts slow DDG, and caches result for 5m TTL."""
+        import time
+
+        from hal9000.websearch import clear_search_cache, search_web_context
+
+        clear_search_cache()
+        http_calls = 0
+        ddg_aborted = threading.Event()
+
+        class _FakeResp:
+            def __init__(self, status_code: int, payload: dict) -> None:
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self) -> dict:
+                return self._payload
+
+        class _RacingClient:
+            def __init__(self, *args, **kwargs) -> None:
+                self._closed = threading.Event()
+
+            def get(self, url: str, params=None):
+                nonlocal http_calls
+                http_calls += 1
+                if "en.wikipedia.org/w/api.php" in url:
+                    return _FakeResp(
+                        200,
+                        {"query": {"search": [{"title": "Riemann hypothesis", "snippet": "Unsolved."}]}},
+                    )
+                if "en.wikipedia.org/api/rest_v1/page/summary" in url:
+                    return _FakeResp(
+                        200,
+                        {
+                            "extract": (
+                                "In mathematics, the Riemann hypothesis is the conjecture that the "
+                                "Riemann zeta function has its zeros only at the negative even integers "
+                                "and complex numbers with real part 1/2. It remains unsolved."
+                            )
+                        },
+                    )
+                # Simulate slow DuckDuckGo Lite hanging for 3 seconds unless aborted
+                if self._closed.wait(timeout=3.0):
+                    ddg_aborted.set()
+                    raise RuntimeError("ddg aborted after wiki grace window")
+                return _FakeResp(200, {})
+
+            def close(self) -> None:
+                self._closed.set()
+
+        t0 = time.perf_counter()
+        with patch("hal9000.websearch.httpx.Client", _RacingClient):
+            res1 = search_web_context(
+                "Search online to see if the Riemann hypothesis has been solved.",
+                timeout_s=3.5,
+                ddg_grace_s=0.08,
+                cache_ttl_s=300.0,
+            )
+            calls_after_first = http_calls
+            res2 = search_web_context(
+                "Search online to see if the Riemann hypothesis has been solved.",
+                timeout_s=3.5,
+                ddg_grace_s=0.08,
+                cache_ttl_s=300.0,
+            )
+        elapsed = time.perf_counter() - t0
+
+        self.assertIn("Riemann hypothesis", res1)
+        self.assertIn("unsolved", res1.lower())
+        self.assertEqual(res2, res1)
+        # Returned quickly after Wikipedia + 0.08s grace without waiting 3.5s for DDG
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(ddg_aborted.wait(timeout=0.5))
+        # Second identical lookup served directly from 5-minute TTL cache (zero extra HTTP calls)
+        self.assertEqual(http_calls, calls_after_first)
+        clear_search_cache()
+
 
 if __name__ == "__main__":
     unittest.main()
