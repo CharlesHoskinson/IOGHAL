@@ -528,7 +528,7 @@ class _FastAudioVAEGraph:
 
 
 class _MegaStepRunner:
-    """Captures the ENTIRE VoxCPM2 autoregressive step (DiT Euler loop + feat_enc + stop + base_lm + res_lm) into 1 CUDA Graph per (steps, cfg)."""
+    """Captures VoxCPM2 autoregressive steps as dual CUDA Graphs (DiT + LM) with early first-chunk yield and zero-waste stop."""
 
     def __init__(self, tts_model) -> None:
         self.m = tts_model
@@ -537,6 +537,7 @@ class _MegaStepRunner:
         self.dtype = get_dtype(tts_model.config.dtype)
         self._graphs: dict[tuple[int, float], dict] = {}
         self._prefix_kv_cache: dict[int, dict] = {}
+        self._loaded_prefix_key: int | None = None
         self._vae_graph = _FastAudioVAEGraph(tts_model.audio_vae, patch_size=tts_model.patch_size)
         self._vae_stream = torch.cuda.Stream()
         # Double-buffered pinned CPU staging for non-blocking D2H audio transfer
@@ -549,12 +550,33 @@ class _MegaStepRunner:
             torch.empty((1, tts_model.feat_dim, tts_model.patch_size), device=self.device, dtype=torch.float32),
             torch.empty((1, tts_model.feat_dim, tts_model.patch_size), device=self.device, dtype=torch.float32),
         ]
-        self._stop_staging = [
-            torch.empty((), dtype=torch.int64, pin_memory=True),
-            torch.empty((), dtype=torch.int64, pin_memory=True),
-        ]
+        self._stop_staging_scalar = torch.empty((), dtype=torch.int64, pin_memory=True)
         self._latent_ready_events = [torch.cuda.Event(), torch.cuda.Event()]
         self._vae_done_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self._stop_ready_event = torch.cuda.Event()
+
+        # Invalidate cached in-place KV prefix if any external path (e.g. non-streaming synthesize) overwrites KV cache
+        for lm in (tts_model.base_lm, tts_model.residual_lm):
+            kv_cache = getattr(lm, "kv_cache", None)
+            if kv_cache is not None and hasattr(kv_cache, "fill_caches"):
+                orig_fill = kv_cache.fill_caches
+
+                def _wrapped_fill(kv_caches, _orig=orig_fill, _runner=self):
+                    _runner._loaded_prefix_key = None
+                    return _orig(kv_caches)
+
+                kv_cache.fill_caches = _wrapped_fill
+
+    @staticmethod
+    def _run_minicpm_bidir(
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        position_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Run bidirectional MiniCPMModel with precomputed RoPE tables (exact pure BF16)."""
+        for layer in model.layers:
+            hidden_states, _ = layer(hidden_states, position_emb, False)
+        return model.norm(hidden_states)
 
     def _get_or_capture_graph(self, n_timesteps: int, cfg_value: float) -> dict:
         key = (int(n_timesteps), round(float(cfg_value), 3))
@@ -587,7 +609,25 @@ class _MegaStepRunner:
         base_step = getattr(m.base_lm, "_forward_step_raw", m.base_lm.forward_step)
         res_step = getattr(m.residual_lm, "_forward_step_raw", m.residual_lm.forward_step)
 
-        # Pre-pack lm_to_dit_proj + res_to_dit_proj into 1 exact pure-BF16 batched GEMM writing directly into mu_in[0]
+        can_fast_dit = all(
+            hasattr(estimator, attr)
+            for attr in (
+                "in_proj",
+                "cond_proj",
+                "out_proj",
+                "time_embeddings",
+                "time_mlp",
+                "delta_time_mlp",
+                "decoder",
+            )
+        )
+        can_fast_enc = (
+            hasattr(feat_enc, "in_proj")
+            and hasattr(feat_enc, "special_token")
+            and hasattr(feat_enc, "encoder")
+        )
+
+        # Pre-pack lm_to_dit_proj + res_to_dit_proj into 1 exact pure-BF16 batched GEMM
         fuse_dit_proj = isinstance(m.lm_to_dit_proj, nn.Linear) and isinstance(m.res_to_dit_proj, nn.Linear)
         if fuse_dit_proj:
             dit_proj_w = torch.stack(
@@ -609,8 +649,7 @@ class _MegaStepRunner:
         else:
             dit_proj_w = None
             dit_proj_b = None
-        mu_in = torch.zeros((2, h_dit * 2), device=device, dtype=dtype)
-        mu_pos_view = mu_in[0].view(2, 1, h_dit)
+
         dt_zeros = torch.zeros((2,), device=device, dtype=dtype)
         schedule_steps: list[tuple[torch.Tensor, torch.Tensor, bool]] = []
         t_cur = t_span[0]
@@ -622,7 +661,45 @@ class _MegaStepRunner:
             if s_idx < len(t_span) - 1:
                 dt_cur = t_cur - t_span[s_idx + 1]
 
-        def step_fn():
+        dit_seq_buf: torch.Tensor | None = None
+        dit_pos_emb: tuple[torch.Tensor, torch.Tensor] | None = None
+        hoisted_steps: list[tuple[torch.Tensor, torch.Tensor]] = []
+        mu_in: torch.Tensor | None = None
+        if can_fast_dit:
+            dit_seq_len = 2 + 1 + p + p
+            dit_seq_buf = torch.zeros((2, dit_seq_len, h_dit), device=device, dtype=dtype)
+            mu_pos_view = dit_seq_buf[0, 0:2, :].view(2, 1, h_dit)
+            dit_rope = getattr(estimator.decoder, "rope_emb", None)
+            if dit_rope is not None:
+                dit_pos_ids = torch.arange(0, dit_seq_len, dtype=torch.long, device=device)
+                c_dit, s_dit = dit_rope(dit_pos_ids)
+                dit_pos_emb = (c_dit.contiguous(), s_dit.contiguous())
+            with torch.inference_mode():
+                for t_val, dt_val, is_zero in schedule_steps:
+                    if not is_zero:
+                        t_in = t_val.expand(2)
+                        dt_in = dt_val.expand(2) if cfm.mean_mode else dt_zeros
+                        t_e = estimator.time_mlp(estimator.time_embeddings(t_in).to(dtype))
+                        dt_e = estimator.delta_time_mlp(estimator.time_embeddings(dt_in).to(dtype))
+                        t_emb_step = (t_e + dt_e).unsqueeze(1).contiguous()
+                        hoisted_steps.append((t_emb_step, dt_val))
+        else:
+            mu_in = torch.zeros((2, h_dit * 2), device=device, dtype=dtype)
+            mu_pos_view = mu_in[0].view(2, 1, h_dit)
+
+        enc_seq_buf: torch.Tensor | None = None
+        enc_pos_emb: tuple[torch.Tensor, torch.Tensor] | None = None
+        if can_fast_enc:
+            h_enc = int(m.config.encoder_config.hidden_dim)
+            enc_seq_buf = torch.zeros((1, 1 + p, h_enc), device=device, dtype=dtype)
+            enc_seq_buf[:, 0:1, :].copy_(feat_enc.special_token.detach().reshape(1, 1, h_enc))
+            enc_rope = getattr(feat_enc.encoder, "rope_emb", None)
+            if enc_rope is not None:
+                enc_pos_ids = torch.arange(0, 1 + p, dtype=torch.long, device=device)
+                c_enc, s_enc = enc_rope(enc_pos_ids)
+                enc_pos_emb = (c_enc.contiguous(), s_enc.contiguous())
+
+        def dit_fn():
             if fuse_dit_proj:
                 if dit_proj_b is not None:
                     torch.baddbmm(dit_proj_b, lm_res_hidden, dit_proj_w, out=mu_pos_view)
@@ -630,11 +707,36 @@ class _MegaStepRunner:
                     torch.bmm(lm_res_hidden, dit_proj_w, out=mu_pos_view)
             else:
                 dit_h = torch.cat((m.lm_to_dit_proj(lm_hidden), m.res_to_dit_proj(res_hidden)), dim=-1)
-                mu_in[0:1].copy_(dit_h)
+                if can_fast_dit and dit_seq_buf is not None:
+                    dit_seq_buf[0, 0:2, :].copy_(dit_h.view(2, h_dit))
+                elif mu_in is not None:
+                    mu_in[0:1].copy_(dit_h)
+
+            if can_fast_dit and dit_seq_buf is not None:
+                # Hoist cond_proj(prefix_cond) once outside the Euler loop (batch=1 broadcast to CFG pair)
+                cond_emb = estimator.cond_proj(prefix_cond)
+                dit_seq_buf[:, 3 : 3 + p, :].copy_(cond_emb)
+                x_t = noise_z.transpose(1, 2).contiguous()  # [1, p, d]
+                for t_emb_step, dt_val in hoisted_steps:
+                    dit_seq_buf[:, 2:3, :].copy_(t_emb_step)
+                    dit_seq_buf[:, 3 + p :, :].copy_(estimator.in_proj(x_t))
+                    hidden = self._run_minicpm_bidir(estimator.decoder, dit_seq_buf, dit_pos_emb)
+                    est_t = estimator.out_proj(hidden[:, 3 + p :, :])
+                    pos_v, neg_v = est_t[0:1], est_t[1:2]
+                    pos_flat = pos_v.reshape(1, -1)
+                    neg_flat = neg_v.reshape(1, -1)
+                    st_star = (
+                        torch.sum(pos_flat * neg_flat, dim=1, keepdim=True)
+                        / (torch.sum(neg_flat * neg_flat, dim=1, keepdim=True) + 1e-8)
+                    ).view(1, 1, 1)
+                    dphi = neg_v * st_star + cfg_value * (pos_v - neg_v * st_star)
+                    x_t = x_t - dt_val * dphi
+                prefix_cond.copy_(x_t)
+                return x_t.transpose(1, 2).contiguous().to(torch.float32)
+
             cond_t = prefix_cond.transpose(1, 2).contiguous()
             x = noise_z
             cond_in = torch.cat((cond_t, cond_t), dim=0)
-
             for t_val, dt_val, is_zero in schedule_steps:
                 if not is_zero:
                     x_in = torch.cat((x, x), dim=0)
@@ -650,44 +752,60 @@ class _MegaStepRunner:
                     ).view(1, 1, 1)
                     dphi = neg_v * st_star + cfg_value * (pos_v - neg_v * st_star)
                     x = x - dt_val * dphi
+            prefix_cond.copy_(x.transpose(1, 2).contiguous())
+            return x.to(torch.float32)
 
-            # x is [1, d, p] -> pred_feat is [1, p, d]
-            pred_feat = x.transpose(1, 2).contiguous()
-            curr_embed = m.enc_to_lm_proj(feat_enc(pred_feat.unsqueeze(1)))[:, 0, :]
-
-            stop_flag = m.stop_head(m.stop_actn(m.stop_proj(lm_hidden))).argmax(dim=-1)[0]
+        def lm_fn():
+            if can_fast_enc and enc_seq_buf is not None:
+                enc_seq_buf[:, 1:, :].copy_(feat_enc.in_proj(prefix_cond))
+                enc_out = self._run_minicpm_bidir(feat_enc.encoder, enc_seq_buf, enc_pos_emb)
+                curr_embed = m.enc_to_lm_proj(enc_out[:, 0, :])
+            else:
+                curr_embed = m.enc_to_lm_proj(feat_enc(prefix_cond.unsqueeze(1)))[:, 0, :]
 
             next_lm = base_step(curr_embed, pos_id)
             next_lm = m.fsq_layer(next_lm)
             curr_res_in = m.fusion_concat_proj(torch.cat((next_lm, curr_embed), dim=-1))
             next_res = res_step(curr_res_in, pos_id)
 
+            # Compute next step's stop decision immediately from next_lm so step i+1 knows whether to skip lm_fn!
+            next_stop_flag = m.stop_head(m.stop_actn(m.stop_proj(next_lm))).argmax(dim=-1)[0]
+
             # Update rolling state in-place for the next step
             lm_hidden.copy_(next_lm)
             res_hidden.copy_(next_res)
-            prefix_cond.copy_(pred_feat)
             pos_id.add_(1)
-            return x.to(torch.float32), stop_flag
+            return next_stop_flag
 
-        # Save KV cache positions before warmup/capture
+        # Capture dual CUDA graphs cleanly under CUDA_GRAPH_LOCK
         with CUDA_GRAPH_LOCK:
             torch.cuda.synchronize()
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.inference_mode(), torch.cuda.stream(stream):
                 for _ in range(3):
+                    _ = dit_fn()
+                for _ in range(3):
                     pos_id.zero_()
-                    _ = step_fn()
+                    _ = lm_fn()
             torch.cuda.current_stream().wait_stream(stream)
 
+            dit_graph = torch.cuda.CUDAGraph()
+            with torch.inference_mode(), torch.cuda.graph(dit_graph):
+                out_latent_fp32 = dit_fn()
+
             pos_id.zero_()
-            graph = torch.cuda.CUDAGraph()
-            with torch.inference_mode(), torch.cuda.graph(graph):
-                out_latent_fp32, out_stop = step_fn()
+            lm_graph = torch.cuda.CUDAGraph()
+            with torch.inference_mode(), torch.cuda.graph(lm_graph):
+                out_stop = lm_fn()
             torch.cuda.synchronize()
 
+        # Warmup/capture wrote KV slot 0; force prefix reload on next stream call
+        self._loaded_prefix_key = None
+
         entry = {
-            "graph": graph,
+            "dit_graph": dit_graph,
+            "lm_graph": lm_graph,
             "lm_hidden": lm_hidden,
             "res_hidden": res_hidden,
             "prefix_cond": prefix_cond,
@@ -702,6 +820,11 @@ class _MegaStepRunner:
                 dit_proj_b,
                 mu_in,
                 mu_pos_view,
+                dit_seq_buf,
+                dit_pos_emb,
+                hoisted_steps,
+                enc_seq_buf,
+                enc_pos_emb,
                 dt_zeros,
                 schedule_steps,
                 t_span,
@@ -710,14 +833,28 @@ class _MegaStepRunner:
         self._graphs[key] = entry
         return entry
 
+    def _ensure_prefix_kv_loaded(self, cache_key: int, snap: dict) -> None:
+        """Populate static KV cache prefix [0:prefix_len] once per prompt_cache snapshot."""
+        if self._loaded_prefix_key == cache_key:
+            return
+        prefix_len = snap["prefix_len"]
+        for lm, pre_kv in (
+            (self.m.base_lm, snap["base_pre_kv"]),
+            (self.m.residual_lm, snap["res_pre_kv"]),
+        ):
+            kv_buf = lm.kv_cache.kv_cache
+            for idx, (pre_k, pre_v) in enumerate(pre_kv):
+                kv_buf[0, idx, :, :, :prefix_len, :].copy_(pre_k)
+                kv_buf[1, idx, :, :, :prefix_len, :].copy_(pre_v)
+        self._loaded_prefix_key = cache_key
+
     @staticmethod
-    def _forward_lm_with_prefix(
+    def _forward_lm_with_prefix_inplace(
         lm: nn.Module,
         suffix_embeds: torch.Tensor,
-        prefix_kv: list[tuple[torch.Tensor, torch.Tensor]],
         prefix_len: int,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """Exact causal incremental prefill reusing a precomputed KV prefix snapshot."""
+    ) -> torch.Tensor:
+        """Exact causal incremental prefill writing suffix KV directly into StaticKVCache (zero cat / zero_)."""
         from voxcpm.modules.minicpm4.model import apply_rotary_pos_emb
 
         bsz, suffix_len, _ = suffix_embeds.size()
@@ -732,8 +869,8 @@ class _MegaStepRunner:
         attn_mask = (k_pos <= q_pos).view(1, 1, suffix_len, total_len)
 
         hidden_states = suffix_embeds
-        next_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for layer, (pre_k, pre_v) in zip(lm.layers, prefix_kv):
+        kv_cache = lm.kv_cache
+        for idx, layer in enumerate(lm.layers):
             residual = hidden_states
             attn = layer.self_attn
             if isinstance(attn.qkv_proj, FP8Linear):
@@ -751,8 +888,11 @@ class _MegaStepRunner:
             if position_emb is not None:
                 cos, sin = position_emb
                 q, k = apply_rotary_pos_emb(q, k, cos, sin)
-            k_full = torch.cat((pre_k, k), dim=2)
-            v_full = torch.cat((pre_v, v), dim=2)
+            k_cache, v_cache = kv_cache.get_layer_cache(idx)
+            k_cache[:, :, prefix_len:total_len, :].copy_(k)
+            v_cache[:, :, prefix_len:total_len, :].copy_(v)
+            k_full = k_cache[:, :, :total_len, :]
+            v_full = v_cache[:, :, :total_len, :]
             attn_out = F.scaled_dot_product_attention(
                 q, k_full, v_full, attn_mask=attn_mask, enable_gqa=True
             )
@@ -776,10 +916,9 @@ class _MegaStepRunner:
                 hidden_states = residual + h_mlp * (layer.scale_depth / (layer.num_hidden_layers**0.5))
             else:
                 hidden_states = residual + h_mlp
-            next_cache.append((k_full, v_full))
 
-        hidden_states = lm.norm(hidden_states)
-        return hidden_states, next_cache
+        kv_cache.current_length = total_len
+        return lm.norm(hidden_states)
 
     def _get_or_build_ref_continuation_prefix(self, prompt_cache: dict) -> dict | None:
         """Precompute static reference feat_encoder embeddings and causal KV prefix once per prompt_cache."""
@@ -903,30 +1042,31 @@ class _MegaStepRunner:
                 if scale_emb != 1.0:
                     rem_text_embed = rem_text_embed * scale_emb
                 suffix_combined = torch.cat((rem_text_embed, prompt_audio_embed), dim=1)
+                total_prefill_len = snap["prefix_len"] + int(suffix_combined.shape[1])
 
-                enc_suf, kv_cache_tuple = self._forward_lm_with_prefix(
-                    m.base_lm, suffix_combined, snap["base_pre_kv"], snap["prefix_len"]
-                )
-                m.base_lm.kv_cache.fill_caches(kv_cache_tuple)
-                if prompt_audio_embed.shape[1] > 0:
-                    enc_suf = torch.cat(
-                        (enc_suf[:, :n_rem_text, :], m.fsq_layer(enc_suf[:, n_rem_text:, :])),
-                        dim=1,
+                if total_prefill_len < int(m.base_lm.kv_cache.max_length):
+                    self._ensure_prefix_kv_loaded(id(prompt_cache), snap)
+                    enc_suf = self._forward_lm_with_prefix_inplace(
+                        m.base_lm, suffix_combined, snap["prefix_len"]
                     )
-                init_lm = enc_suf[:, -1, :]
+                    if prompt_audio_embed.shape[1] > 0:
+                        enc_suf = torch.cat(
+                            (enc_suf[:, :n_rem_text, :], m.fsq_layer(enc_suf[:, n_rem_text:, :])),
+                            dim=1,
+                        )
+                    init_lm = enc_suf[:, -1, :]
 
-                zeros_rem_feat = torch.zeros(
-                    (1, n_rem_text, prompt_audio_embed.shape[-1]), device=device, dtype=dtype
-                )
-                rem_feat_embed = torch.cat((zeros_rem_feat, prompt_audio_embed), dim=1)
-                res_suf_in = m.fusion_concat_proj(torch.cat((enc_suf, rem_feat_embed), dim=-1))
-                res_suf_out, res_kv = self._forward_lm_with_prefix(
-                    m.residual_lm, res_suf_in, snap["res_pre_kv"], snap["prefix_len"]
-                )
-                m.residual_lm.kv_cache.fill_caches(res_kv)
-                init_res = res_suf_out[:, -1, :]
-                last_audio_cond = snap["last_audio_feat"]
-                used_prefix_cache = True
+                    zeros_rem_feat = torch.zeros(
+                        (1, n_rem_text, prompt_audio_embed.shape[-1]), device=device, dtype=dtype
+                    )
+                    rem_feat_embed = torch.cat((zeros_rem_feat, prompt_audio_embed), dim=1)
+                    res_suf_in = m.fusion_concat_proj(torch.cat((enc_suf, rem_feat_embed), dim=-1))
+                    res_suf_out = self._forward_lm_with_prefix_inplace(
+                        m.residual_lm, res_suf_in, snap["prefix_len"]
+                    )
+                    init_res = res_suf_out[:, -1, :]
+                    last_audio_cond = snap["last_audio_feat"]
+                    used_prefix_cache = True
 
         if not used_prefix_cache:
             # Standard full prefill fallback (only build full CPU/GPU tensors when prefix cache misses)
@@ -1026,15 +1166,20 @@ class _MegaStepRunner:
         # Pre-sample all diffusion noise for this sentence in 1 kernel call (reproducible with seed!)
         all_noise = torch.randn((eff_max_len, 1, m.feat_dim, m.patch_size), device=device, dtype=dtype)
         latent_staging = self._latent_staging
-        stop_staging = self._stop_staging
+        stop_staging_scalar = self._stop_staging_scalar
         latent_ready_events = self._latent_ready_events
         vae_done_events = self._vae_done_events
+        stop_ready_event = self._stop_ready_event
+        stop_0 = (
+            int(m.stop_head(m.stop_actn(m.stop_proj(init_lm))).argmax(dim=-1)[0].item())
+            if min_len < 0
+            else 0
+        )
 
         main_stream = torch.cuda.current_stream()
         vae_stream = self._vae_stream
         vae_slot_active = [False, False]
         pending_slot: int | None = None
-        pending_step: int = -1
 
         try:
             for i in range(eff_max_len):
@@ -1049,13 +1194,13 @@ class _MegaStepRunner:
                     if pending_slot == slot:
                         yield self._pinned_bufs[slot].numpy().copy()
                         pending_slot = None
+                        if stop_event is not None and stop_event.is_set():
+                            break
 
-                # Replay the ENTIRE autoregressive step on main_stream
+                # Phase 1: Replay DiT Euler CUDA Graph to produce chunk i latent immediately
                 g["noise_z"].copy_(all_noise[i])
-                g["graph"].replay()
+                g["dit_graph"].replay()
                 latent_staging[slot].copy_(g["out_latent"])
-                stop_staging[slot].copy_(g["out_stop"], non_blocking=True)
-
                 latent_ready_events[slot].record(main_stream)
 
                 # Launch AudioVAE FP32 CUDA Graph + non-blocking D2H copy on vae_stream!
@@ -1066,31 +1211,59 @@ class _MegaStepRunner:
                     vae_done_events[slot].record(vae_stream)
                     vae_slot_active[slot] = True
 
-                # Yield the PREVIOUS step's audio while current step's VAE decodes in parallel!
-                prev_slot = 1 - slot
-                if pending_slot == prev_slot and vae_slot_active[prev_slot]:
-                    vae_done_events[prev_slot].synchronize()
-                    vae_slot_active[prev_slot] = False
-                    yield self._pinned_bufs[prev_slot].numpy().copy()
-                    # Check previous step's stop flag (already ready with zero extra stall!)
-                    if pending_step > min_len and int(stop_staging[prev_slot].item()) == 1:
-                        vae_done_events[slot].synchronize()
-                        vae_slot_active[slot] = False
-                        pending_slot = None
+                # Fast-path Chunk 0: yield first audio BEFORE running LM update for step 1!
+                if i == 0:
+                    vae_done_events[0].synchronize()
+                    vae_slot_active[0] = False
+                    yield self._pinned_bufs[0].numpy().copy()
+                    if stop_event is not None and stop_event.is_set():
                         break
-                    pending_slot = None
+                    if (0 > min_len and stop_0 == 1) or eff_max_len == 1:
+                        break
+                    g["lm_graph"].replay()
+                    stop_staging_scalar.copy_(g["out_stop"], non_blocking=True)
+                    stop_ready_event.record(main_stream)
+                    continue
 
-                pending_slot = slot
-                pending_step = i
+                # Check stop flag computed at end of step i-1's LM update (already ready while dit_i runs!)
+                should_stop = False
+                if i > min_len:
+                    stop_ready_event.synchronize()
+                    should_stop = int(stop_staging_scalar.item()) == 1
 
-                # Check stop flag immediately if this is the last allowed step
-                if i == eff_max_len - 1:
+                is_last = should_stop or (i == eff_max_len - 1)
+                prev_slot = 1 - slot
+
+                if not is_last:
+                    # Phase 2: Launch LM update on main_stream overlapped with vae_stream decoding chunk i!
+                    g["lm_graph"].replay()
+                    stop_staging_scalar.copy_(g["out_stop"], non_blocking=True)
+                    stop_ready_event.record(main_stream)
+
+                    if pending_slot == prev_slot and vae_slot_active[prev_slot]:
+                        vae_done_events[prev_slot].synchronize()
+                        vae_slot_active[prev_slot] = False
+                        yield self._pinned_bufs[prev_slot].numpy().copy()
+                        pending_slot = None
+
+                    pending_slot = slot
+                else:
+                    # Zero-waste stop: skip lm_graph & all future steps, flush remaining chunks cleanly!
+                    if pending_slot == prev_slot and vae_slot_active[prev_slot]:
+                        vae_done_events[prev_slot].synchronize()
+                        vae_slot_active[prev_slot] = False
+                        yield self._pinned_bufs[prev_slot].numpy().copy()
+                        pending_slot = None
+                        if stop_event is not None and stop_event.is_set():
+                            break
                     vae_done_events[slot].synchronize()
                     vae_slot_active[slot] = False
-                    yield self._pinned_bufs[slot].numpy().copy()
+                    if stop_event is None or not stop_event.is_set():
+                        yield self._pinned_bufs[slot].numpy().copy()
                     pending_slot = None
+                    break
 
-            # Flush final buffered chunk if loop exited without hitting max_len or stop_event
+            # Flush final buffered chunk if loop exited without hitting is_last or stop_event
             if pending_slot is not None:
                 if vae_slot_active[pending_slot]:
                     vae_done_events[pending_slot].synchronize()
