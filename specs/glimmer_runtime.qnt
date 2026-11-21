@@ -91,6 +91,7 @@ module glimmer_runtime {
     commitHistoryAfterTts: bool,
     keepSystemPromptInvariant: bool,
     enforceCudaCaptureExclusivity: bool,
+    scopedRetiredCancel: bool,
   }
 
   type ClientTurn = {
@@ -103,6 +104,7 @@ module glimmer_runtime {
     workerHistoryGen: int,
     phase: LlmPhase,
     cancelRequested: bool,
+    retiredWorkerCleanupPending: bool,
     llmProducedSentence: bool,
     ttsSpokenSentence: bool,
     audioStarted: bool,
@@ -125,6 +127,7 @@ module glimmer_runtime {
     nonDefaultStepsCaptured: bool,
     llmHttp500Recovered: bool,
     llmMidStreamDisconnectRecovered: bool,
+    scopedRetiredCancelVerified: bool,
   }
 
   pure val fixedConfig: RuntimeConfig = {
@@ -138,6 +141,7 @@ module glimmer_runtime {
     commitHistoryAfterTts: true,
     keepSystemPromptInvariant: true,
     enforceCudaCaptureExclusivity: true,
+    scopedRetiredCancel: true,
   }
 
   pure def modelBackend(m: ModelId): Backend =
@@ -218,6 +222,7 @@ module glimmer_runtime {
   var ollamaCgroupOom: bool
   var dualBackendCollision: bool
   var atemLeakedToTts: bool
+  var activePoolCrossKilled: bool
   var cov: Coverage
 
   pure val initCudaReady: CudaState = {
@@ -252,6 +257,7 @@ module glimmer_runtime {
     workerHistoryGen: 0,
     phase: PhaseIdle,
     cancelRequested: false,
+    retiredWorkerCleanupPending: false,
     llmProducedSentence: false,
     ttsSpokenSentence: false,
     audioStarted: false,
@@ -274,6 +280,7 @@ module glimmer_runtime {
     nonDefaultStepsCaptured: false,
     llmHttp500Recovered: false,
     llmMidStreamDisconnectRecovered: false,
+    scopedRetiredCancelVerified: false,
   }
 
   action initBase(c: RuntimeConfig, startModel: ModelId, startCuda: CudaState): bool = all {
@@ -295,6 +302,7 @@ module glimmer_runtime {
     ollamaCgroupOom' = (modelBackend(startModel) == BackendOllama and modelMemGb(startModel) > OLLAMA_CGROUP_MAX_GB),
     dualBackendCollision' = false,
     atemLeakedToTts' = false,
+    activePoolCrossKilled' = false,
     cov' = initCov,
   }
 
@@ -374,6 +382,7 @@ module glimmer_runtime {
       staleWarmupEvictions' = staleWarmupEvictions,
       silentEmptyDrops' = silentEmptyDrops,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = {
@@ -415,6 +424,7 @@ module glimmer_runtime {
       modeSwitchReloads' = modeSwitchReloads,
       silentEmptyDrops' = silentEmptyDrops,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = { ...cov, warmupSerialized: cov.warmupSerialized or cfg.serializeWarmups },
@@ -456,6 +466,7 @@ module glimmer_runtime {
         workerHistoryGen: t.historyGen,
         phase: PhasePreStream,
         cancelRequested: false,
+        retiredWorkerCleanupPending: t.phase != PhaseIdle or t.retiredWorkerCleanupPending,
         llmProducedSentence: false,
         ttsSpokenSentence: false,
         audioStarted: false,
@@ -477,6 +488,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = {
@@ -515,6 +527,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = cov,
@@ -610,6 +623,7 @@ module glimmer_runtime {
       staleWarmupEvictions' = staleWarmupEvictions,
       silentEmptyDrops' = silentEmptyDrops,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
     }
@@ -625,6 +639,7 @@ module glimmer_runtime {
       isSlotHeldBy(llmSlot, id, t.workerGen),
       turns' = turns.put(id, { ...t, phase: PhaseSpeakingUser }),
       atemLeakedToTts' = (atemLeakedToTts or leaked),
+      activePoolCrossKilled' = activePoolCrossKilled,
       llmSlot' = llmSlot,
       ollamaLoaded' = ollamaLoaded,
       llamaServerLoaded' = llamaServerLoaded,
@@ -689,6 +704,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
     }
@@ -734,6 +750,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = cov,
@@ -762,6 +779,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = cov,
@@ -813,6 +831,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = cov,
@@ -851,6 +870,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = cov,
@@ -900,6 +920,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = cov,
@@ -951,6 +972,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = {
@@ -1002,6 +1024,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = {
@@ -1049,6 +1072,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = { ...cov, resetMidTurn: cov.resetMidTurn or wasActive },
@@ -1085,6 +1109,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = { ...cov, llmHttp500Recovered: true },
@@ -1121,6 +1146,7 @@ module glimmer_runtime {
       ollamaCgroupOom' = ollamaCgroupOom,
       dualBackendCollision' = dualBackendCollision,
       atemLeakedToTts' = atemLeakedToTts,
+      activePoolCrossKilled' = activePoolCrossKilled,
       cfg' = cfg,
       cuda' = cuda,
       cov' = { ...cov, llmMidStreamDisconnectRecovered: true },
@@ -1146,7 +1172,49 @@ module glimmer_runtime {
     ollamaCgroupOom' = ollamaCgroupOom,
     dualBackendCollision' = dualBackendCollision,
     atemLeakedToTts' = atemLeakedToTts,
+    activePoolCrossKilled' = activePoolCrossKilled,
     cfg' = cfg,
+  }
+
+  // Retired Turn 1 worker executes `pipeline.py:finally:` `_cancel_brain_inflight(self.brain)` AFTER
+  // Turn 2 has already started and opened its own pooled HTTP client.
+  // Without `scopedRetiredCancel` (`cancel_inflight(only_stopped=True)`), retired Turn 1 kills Turn 2's active pool!
+  action retiredWorkerFinallyCleanup(id: int): bool = {
+    val t = turns.get(id)
+    val activeNewTurn = isSlotHeldBy(llmSlot, id, t.workerGen)
+    val crossKilled = activeNewTurn and not(cfg.scopedRetiredCancel)
+    all {
+      t.retiredWorkerCleanupPending,
+      turns' = turns.put(id, {
+        ...t,
+        retiredWorkerCleanupPending: false,
+        phase: if (crossKilled) PhaseIdle else t.phase,
+        uiState: if (crossKilled) UiIdle else t.uiState,
+        audioStarted: if (crossKilled) false else t.audioStarted,
+      }),
+      llmSlot' = if (crossKilled) SlotFree else llmSlot,
+      activePoolCrossKilled' = (activePoolCrossKilled or crossKilled),
+      ollamaLoaded' = ollamaLoaded,
+      llamaServerLoaded' = llamaServerLoaded,
+      activeGlobalModel' = activeGlobalModel,
+      warmupSeq' = warmupSeq,
+      pendingWarmups' = pendingWarmups,
+      history' = history,
+      lastKvPromptTag' = lastKvPromptTag,
+      kvModeInvalidations' = kvModeInvalidations,
+      modeSwitchReloads' = modeSwitchReloads,
+      staleWarmupEvictions' = staleWarmupEvictions,
+      silentEmptyDrops' = silentEmptyDrops,
+      ollamaCgroupOom' = ollamaCgroupOom,
+      dualBackendCollision' = dualBackendCollision,
+      atemLeakedToTts' = atemLeakedToTts,
+      cfg' = cfg,
+      cuda' = cuda,
+      cov' = {
+        ...cov,
+        scopedRetiredCancelVerified: cov.scopedRetiredCancelVerified or (activeNewTurn and cfg.scopedRetiredCancel),
+      },
+    }
   }
 
   // Startup thread performs non-capture CUDA/RNG work (weight load, FP8 quant, prompt_cache, torch.randn).
@@ -1325,6 +1393,7 @@ module glimmer_runtime {
       ttsFailMidTurn(id),
       clientCancelEscape(id),
       clientReset(id),
+      retiredWorkerFinallyCleanup(id),
       cudaBeginStartupOp(CudaActorWhisperInit),
       cudaEndStartupOp(CudaActorWhisperInit),
       cudaBeginStartupOp(CudaActorVoxcpmInit),
@@ -1395,6 +1464,9 @@ module glimmer_runtime {
     cuda.capturing.size() > 0 implies cuda.runningOp.size() == 0,
   }
 
+  // 8. Scoped retired-worker cleanup NEVER cancels a newer turn's active pooled HTTP client (Bug 2c).
+  val invNoCrossTurnPoolCancel: bool = not(activePoolCrossKilled)
+
   val allInvariants: bool = and {
     invOllamaCgroupSafe,
     invSingleActiveLlmBackend,
@@ -1409,6 +1481,7 @@ module glimmer_runtime {
     invNoOrphanAudioStart,
     invNoStuckUiWhenIdle,
     invCudaGraphCaptureExclusive,
+    invNoCrossTurnPoolCancel,
   }
 
   // --- Reachability Witnesses ---
@@ -1425,4 +1498,5 @@ module glimmer_runtime {
   val wNonDefaultStepsCaptured: bool = cov.nonDefaultStepsCaptured
   val wLlmHttp500Recovered: bool = cov.llmHttp500Recovered
   val wLlmMidStreamDisconnectRecovered: bool = cov.llmMidStreamDisconnectRecovered
+  val wScopedRetiredCancelVerified: bool = cov.scopedRetiredCancelVerified
 }

@@ -1154,6 +1154,107 @@ class TestPipelineAndServer(unittest.TestCase):
         self.assertEqual(clause_strong, "All systems remain nominal;")
         self.assertEqual(rem_strong, "however, the antenna bears watching.")
 
+    def test_scoped_retired_cancel_preserves_new_turn_pooled_client_bug2c(self) -> None:
+        """Quint Bug 2c regression: retired Turn 1 cleanup must not close Turn 2's active pooled client."""
+        created: list[object] = []
+
+        class _TrackedClient:
+            def __init__(self, *args, **kwargs) -> None:
+                self.is_closed = False
+                created.append(self)
+
+            def close(self) -> None:
+                self.is_closed = True
+
+        brain = OllamaBrain(
+            model="muse-glimmer-30b-dflash",
+            backend="llama_server",
+            llama_server_url="http://127.0.0.1:8080",
+            llama_server_models={"muse-glimmer-30b-dflash"},
+        )
+        turn1_cancel = threading.Event()
+        turn2_cancel = threading.Event()
+
+        with patch("hal9000.brain.httpx.Client", _TrackedClient):
+            acq1 = brain._acquire_http_client(turn1_cancel.is_set)
+            self.assertIsNotNone(acq1)
+            assert acq1 is not None
+            sid1, client1 = acq1
+
+            # Barge-in: server cancels Turn 1 and starts Turn 2 on a fresh pooled client
+            turn1_cancel.set()
+            brain.cancel_inflight()
+            self.assertTrue(client1.is_closed)
+
+            acq2 = brain._acquire_http_client(turn2_cancel.is_set)
+            self.assertIsNotNone(acq2)
+            assert acq2 is not None
+            sid2, client2 = acq2
+            self.assertIsNot(client1, client2)
+            self.assertFalse(client2.is_closed)
+
+            # Retired Turn 1 pipeline finally block runs scoped cancel_inflight(only_stopped=True)
+            brain.cancel_inflight(only_stopped=True)
+            self.assertFalse(client2.is_closed)
+            self.assertIs(brain._http_client, client2)
+
+            # Now simulate Turn 2 TTS failure: Turn 2 sets its own cancel_event -> scoped cancel closes client2!
+            turn2_cancel.set()
+            brain.cancel_inflight(only_stopped=True)
+            self.assertTrue(client2.is_closed)
+            self.assertIsNone(brain._http_client)
+
+            brain._release_http_client(sid1, client1, healthy=False)
+            brain._release_http_client(sid2, client2, healthy=False)
+
+    def test_glimmer_low_think_includes_four_key_reasoning_budget_fallback(self) -> None:
+        """Low-Think requests to llama-server include all 4 ATEM reasoning_budget_* keys for bundled fallback."""
+        posted: list[dict] = []
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def iter_lines(self):
+                yield 'data: {"choices":[{"delta":{"content":"15:35, Charles."},"finish_reason":"stop"}]}'
+                yield "data: [DONE]"
+
+        class _CaptureClient:
+            def __init__(self, *args, **kwargs) -> None:
+                self.is_closed = False
+
+            def stream(self, method: str, url: str, json: dict):
+                posted.append(json)
+                return _FakeResp()
+
+            def close(self) -> None:
+                self.is_closed = True
+
+        brain = OllamaBrain(
+            model="muse-glimmer-30b-dflash",
+            backend="llama_server",
+            llama_server_url="http://127.0.0.1:8080",
+            llama_server_models={"muse-glimmer-30b-dflash"},
+            thinking_mode="auto",
+            reasoning_budget=64,
+        )
+        with patch("hal9000.brain.httpx.Client", _CaptureClient):
+            out = list(brain.stream_reply_sentences("Calculate 40 * 2 minutes after 14:15."))
+        self.assertEqual(out, ["15:35, Charles."])
+        self.assertEqual(len(posted), 1)
+        p = posted[0]
+        self.assertEqual(p["reasoning_budget_tokens"], 64)
+        self.assertEqual(p["reasoning_budget_start_tag"], "<|start|>assistant to=self<|message|>")
+        self.assertEqual(p["reasoning_budget_end_tags"], ["<|eom|>"])
+        self.assertEqual(p["reasoning_budget_message"], "")
+        brain.close()
+
 
 if __name__ == "__main__":
     unittest.main()

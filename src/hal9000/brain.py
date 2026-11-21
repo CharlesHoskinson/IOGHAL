@@ -672,7 +672,8 @@ class OllamaBrain:
         self._lock = threading.Lock()
         self._history_gen = 0
         self._http_client: httpx.Client | None = None
-        self._active_clients: dict[httpx.Client, int] = {}
+        self._stream_seq = 0
+        self._active_streams: dict[int, tuple[httpx.Client, Callable[[], bool] | None]] = {}
 
     def get_model(self) -> str:
         with self._lock:
@@ -696,8 +697,8 @@ class OllamaBrain:
 
     def _acquire_http_client(
         self, stop_check: Callable[[], bool] | None = None
-    ) -> httpx.Client | None:
-        """Return a warm keep-alive client or abort atomically if ``stop_check`` is already set."""
+    ) -> tuple[int, httpx.Client] | None:
+        """Return ``(stream_id, warm_client)`` or abort atomically if ``stop_check`` is already set."""
         with self._lock:
             if stop_check is not None and stop_check():
                 return None
@@ -712,34 +713,54 @@ class OllamaBrain:
                     ),
                 )
                 self._http_client = client
-            self._active_clients[client] = self._active_clients.get(client, 0) + 1
-            return client
+            self._stream_seq += 1
+            stream_id = self._stream_seq
+            self._active_streams[stream_id] = (client, stop_check)
+            return stream_id, client
 
-    def _release_http_client(self, client: httpx.Client, *, healthy: bool) -> None:
+    def _release_http_client(
+        self, stream_id: int, client: httpx.Client, *, healthy: bool
+    ) -> None:
         with self._lock:
-            remaining = self._active_clients.get(client, 0) - 1
-            if remaining <= 0:
-                self._active_clients.pop(client, None)
-            else:
-                self._active_clients[client] = remaining
+            self._active_streams.pop(stream_id, None)
             if not healthy and self._http_client is client:
                 self._http_client = None
-            should_close = (client is not self._http_client) and (
-                client not in self._active_clients
-            )
+            still_active = any(c is client for c, _ in self._active_streams.values())
+            should_close = (client is not self._http_client) and not still_active
         if should_close:
             with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
                 client.close()
 
-    def cancel_inflight(self) -> None:
-        """Abort any active LLM HTTP streams (including KV warmup) immediately on barge-in or disconnect."""
+    def cancel_inflight(self, *, only_stopped: bool = False) -> None:
+        """Abort active LLM HTTP streams immediately on barge-in, failure, or disconnect.
+
+        When ``only_stopped=True`` (used by retired pipeline cleanup), only streams whose own
+        ``stop_check()`` is already set are cancelled, and any client still actively shared with
+        a newer live turn is preserved (Quint Bug 2c guard).
+        """
         with self._lock:
-            clients = list(self._active_clients.keys())
-            self._active_clients.clear()
-            pooled = self._http_client
-            self._http_client = None
-            if pooled is not None and pooled not in clients:
-                clients.append(pooled)
+            if not only_stopped:
+                clients = list({c for c, _ in self._active_streams.values()})
+                self._active_streams.clear()
+                pooled = self._http_client
+                self._http_client = None
+                if pooled is not None and pooled not in clients:
+                    clients.append(pooled)
+            else:
+                stopped_ids: list[int] = []
+                stopped_clients: set[httpx.Client] = set()
+                live_clients: set[httpx.Client] = set()
+                for sid, (client, stop_check) in self._active_streams.items():
+                    if stop_check is not None and stop_check():
+                        stopped_ids.append(sid)
+                        stopped_clients.add(client)
+                    else:
+                        live_clients.add(client)
+                for sid in stopped_ids:
+                    self._active_streams.pop(sid, None)
+                clients = [c for c in stopped_clients if c not in live_clients]
+                if self._http_client in clients:
+                    self._http_client = None
         for client in clients:
             with contextlib.suppress(httpx.HTTPError, OSError, RuntimeError):
                 client.close()
@@ -824,9 +845,10 @@ class OllamaBrain:
         if is_glimmer:
             payload["reasoning_format"] = "deepseek"
 
-        client = self._acquire_http_client(stop_check)
-        if client is None:
+        acquired = self._acquire_http_client(stop_check)
+        if acquired is None:
             return False
+        stream_id, client = acquired
         healthy = False
         try:
             resp = client.post(endpoint, json=payload)
@@ -836,7 +858,7 @@ class OllamaBrain:
         except (httpx.HTTPError, OSError):
             return False
         finally:
-            self._release_http_client(client, healthy=healthy)
+            self._release_http_client(stream_id, client, healthy=healthy)
 
     def _build_messages(
         self,
@@ -925,7 +947,15 @@ class OllamaBrain:
                     "reasoning_strength": "low",
                 }
                 payload["reasoning_format"] = "deepseek"
-                payload["reasoning_budget_tokens"] = self.reasoning_budget if use_low_think else 0
+                if use_low_think:
+                    payload["reasoning_budget_tokens"] = self.reasoning_budget
+                    # Explicitly supply ATEM tags + message so reasoning budget is enforced even
+                    # on unpatched/bundled llama-server builds (see common/parsers/muse-glimmer.cpp).
+                    payload["reasoning_budget_start_tag"] = "<|start|>assistant to=self<|message|>"
+                    payload["reasoning_budget_end_tags"] = ["<|eom|>"]
+                    payload["reasoning_budget_message"] = ""
+                else:
+                    payload["reasoning_budget_tokens"] = 0
             else:
                 payload["chat_template_kwargs"] = {"enable_thinking": False}
                 payload["reasoning_budget_tokens"] = 0
@@ -958,9 +988,10 @@ class OllamaBrain:
 
         # Quint Bug 2a fix: check stop_check() atomically under self._lock before acquiring client
         # so a cancelled turn can never open a zombie stream on llama-server --parallel 1.
-        client = self._acquire_http_client(stop_check)
-        if client is None:
+        acquired = self._acquire_http_client(stop_check)
+        if acquired is None:
             return [], False, False
+        stream_id, client = acquired
 
         def _emit_chunk(raw_text: str) -> str | None:
             cleaned = enforce_user_address(clean_for_speech(raw_text), self.user_name)
@@ -1036,7 +1067,7 @@ class OllamaBrain:
                 return full_parts, False, reasoning_seen
             raise
         finally:
-            self._release_http_client(client, healthy=stream_healthy)
+            self._release_http_client(stream_id, client, healthy=stream_healthy)
 
         if stop_check is not None and stop_check():
             return full_parts, False, reasoning_seen

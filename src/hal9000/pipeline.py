@@ -34,10 +34,17 @@ def _brain_accepts_extra_context(brain: BrainProvider) -> bool:
     return _brain_accepts_param(brain, "extra_context")
 
 
-def _cancel_brain_inflight(brain: BrainProvider) -> None:
+def _cancel_brain_inflight(brain: BrainProvider, *, only_stopped: bool = True) -> None:
     cancel_fn = getattr(brain, "cancel_inflight", None)
     if callable(cancel_fn):
         try:
+            if only_stopped:
+                try:
+                    if "only_stopped" in inspect.signature(cancel_fn).parameters:
+                        cancel_fn(only_stopped=True)
+                        return
+                except (TypeError, ValueError):
+                    pass
             cancel_fn()
         except Exception:
             logger.debug("Brain cancel_inflight hook failed", exc_info=True)

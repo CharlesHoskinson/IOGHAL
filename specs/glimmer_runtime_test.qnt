@@ -282,4 +282,36 @@ module glimmer_runtime_test {
       .expect(history.length() == 0)
       .expect(cov.llmMidStreamDisconnectRecovered)
       .expect(allInvariants)
+
+  // Counterexample 2c (`pipeline.py:351` + pooled HTTP client): Retired Turn 1's `finally:` runs
+  // unscoped `brain.cancel_inflight()` AFTER Turn 2 already acquired its pooled HTTP client,
+  // cross-cancelling Turn 2 mid-stream!
+  run bug2c_retiredWorkerKillsNewTurnPoolCounterexampleTest =
+    initWithConfig({ ...fixedConfig, scopedRetiredCancel: false }, ModelGlimmerQ4Llama)
+      .then(startTurn(1, ModeLowThink))
+      .then(llmOpenStream(1))
+      .then(startTurn(1, ModeZeroThink))       // barge-in starts Turn 2 while Turn 1 unwinds
+      .then(llmOpenStream(1))                  // Turn 2 acquires fresh pooled HTTP client
+      .then(retiredWorkerFinallyCleanup(1))    // unscoped cancel kills Turn 2's live client!
+      .expect(activePoolCrossKilled)
+      .expect(not(invNoCrossTurnPoolCancel))
+
+  // Fixed 8: Scoped `cancel_inflight(only_stopped=True)` in retired Turn 1 cleanup preserves
+  // Turn 2's live pooled HTTP client so Turn 2 completes cleanly with all invariants satisfied.
+  run fixedScopedCancelPreservesNewTurnPoolTest =
+    init
+      .then(startTurn(1, ModeLowThink))
+      .then(llmOpenStream(1))
+      .then(startTurn(1, ModeZeroThink))
+      .then(llmOpenStream(1))
+      .then(retiredWorkerFinallyCleanup(1))
+      .expect(not(activePoolCrossKilled))
+      .expect(isSlotHeldBy(llmSlot, 1, 2))
+      .expect(cov.scopedRetiredCancelVerified)
+      .then(llmProduceSentence(1))
+      .then(llmFinishAheadOfTts(1))
+      .then(ttsSpeakSentence(1))
+      .then(pipelineCompleteClean(1))
+      .expect(history.length() == 1)
+      .expect(allInvariants)
 }
