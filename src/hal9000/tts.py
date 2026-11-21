@@ -367,6 +367,7 @@ class _MegaStepRunner:
         from voxcpm.model.utils import get_dtype
         self.dtype = get_dtype(tts_model.config.dtype)
         self._graphs: dict[tuple[int, float], dict] = {}
+        self._prefix_kv_cache: dict[int, dict] = {}
         self._vae_graph = _FastAudioVAEGraph(tts_model.audio_vae, patch_size=tts_model.patch_size)
         self._vae_stream = torch.cuda.Stream()
         # Double-buffered pinned CPU staging for non-blocking D2H audio transfer
@@ -490,6 +491,120 @@ class _MegaStepRunner:
         self._graphs[key] = entry
         return entry
 
+    @staticmethod
+    def _forward_lm_with_prefix(
+        lm: nn.Module,
+        suffix_embeds: torch.Tensor,
+        prefix_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        prefix_len: int,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Exact causal incremental prefill reusing a precomputed KV prefix snapshot."""
+        from voxcpm.modules.minicpm4.model import apply_rotary_pos_emb
+
+        bsz, suffix_len, _ = suffix_embeds.size()
+        device = suffix_embeds.device
+        total_len = prefix_len + suffix_len
+        pos_ids = torch.arange(prefix_len, total_len, dtype=torch.long, device=device)
+        position_emb = lm.rope_emb(pos_ids) if lm.rope_emb is not None else None
+
+        # Causal mask: suffix query i (global pos prefix_len + i) attends to all keys j <= prefix_len + i
+        q_pos = pos_ids.view(suffix_len, 1)
+        k_pos = torch.arange(total_len, dtype=torch.long, device=device).view(1, total_len)
+        attn_mask = (k_pos <= q_pos).view(1, 1, suffix_len, total_len)
+
+        hidden_states = suffix_embeds
+        next_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer, (pre_k, pre_v) in zip(lm.layers, prefix_kv):
+            residual = hidden_states
+            h = layer.input_layernorm(hidden_states)
+            attn = layer.self_attn
+            qkv = attn.qkv_proj(h)
+            q, k, v = qkv.split([attn._q_dim, attn._kv_dim, attn._kv_dim], dim=-1)
+            q = q.view(bsz, suffix_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+            k = k.view(bsz, suffix_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+            v = v.view(bsz, suffix_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+            if position_emb is not None:
+                cos, sin = position_emb
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            k_full = torch.cat((pre_k, k), dim=2)
+            v_full = torch.cat((pre_v, v), dim=2)
+            attn_out = F.scaled_dot_product_attention(
+                q, k_full, v_full, attn_mask=attn_mask, enable_gqa=True
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().reshape(bsz, suffix_len, attn._q_dim)
+            attn_out = attn.o_proj(attn_out)
+            if layer.use_mup:
+                hidden_states = residual + attn_out * (layer.scale_depth / (layer.num_hidden_layers**0.5))
+            else:
+                hidden_states = residual + attn_out
+
+            residual = hidden_states
+            h_mlp = layer.mlp(layer.post_attention_layernorm(hidden_states))
+            if layer.use_mup:
+                hidden_states = residual + h_mlp * (layer.scale_depth / (layer.num_hidden_layers**0.5))
+            else:
+                hidden_states = residual + h_mlp
+            next_cache.append((k_full, v_full))
+
+        hidden_states = lm.norm(hidden_states)
+        return hidden_states, next_cache
+
+    def _get_or_build_ref_continuation_prefix(self, prompt_cache: dict) -> dict | None:
+        """Precompute static reference feat_encoder embeddings and causal KV prefix once per prompt_cache."""
+        cache_key = id(prompt_cache)
+        if cache_key in self._prefix_kv_cache:
+            return self._prefix_kv_cache[cache_key]
+
+        m = self.m
+        device = self.device
+        dtype = self.dtype
+        prompt_text = prompt_cache.get("prompt_text", "")
+        # Trim trailing space so SentencePiece/BPE boundary matches tokenizer(prompt_text + target_text)
+        stable_prompt_text = prompt_text.rstrip()
+        stable_text_tokens = torch.LongTensor(m.text_tokenizer(stable_prompt_text))
+        n_stable_text = int(stable_text_tokens.shape[0])
+
+        ref_audio_feat = prompt_cache["ref_audio_feat"]
+        prompt_audio_feat = prompt_cache["audio_feat"]
+        ref_tokens, ref_feats, ref_t_mask, ref_a_mask = m._make_ref_prefix(ref_audio_feat, stable_text_tokens.device)
+
+        prefill_enc = getattr(m, "_feat_encoder_raw", m.feat_encoder)
+        scale_emb = m.config.lm_config.scale_emb if getattr(m.config.lm_config, "use_mup", False) else 1.0
+
+        # Precompute patch-independent feat_encoder embeddings for both static audio segments ONCE
+        ref_feats_gpu = ref_feats.unsqueeze(0).to(device=device, dtype=dtype)
+        prompt_audio_gpu = prompt_audio_feat.unsqueeze(0).to(device=device, dtype=dtype)
+        ref_feat_embed = m.enc_to_lm_proj(prefill_enc(ref_feats_gpu))
+        prompt_audio_embed = m.enc_to_lm_proj(prefill_enc(prompt_audio_gpu))
+
+        # Causal static prefix: [ref_tokens, stable_text_tokens]
+        prefix_tokens = torch.cat([ref_tokens, stable_text_tokens]).unsqueeze(0).to(device)
+        prefix_t_mask = torch.cat([ref_t_mask, torch.ones(n_stable_text, dtype=torch.int32)]).unsqueeze(0).to(device)
+        prefix_a_mask = torch.cat([ref_a_mask, torch.zeros(n_stable_text, dtype=torch.int32)]).unsqueeze(0).to(device)
+        prefix_len = int(prefix_tokens.shape[1])
+
+        prefix_text_embed = m.base_lm.embed_tokens(prefix_tokens) * scale_emb
+        zeros_text_feat = torch.zeros((1, n_stable_text, ref_feat_embed.shape[-1]), device=device, dtype=dtype)
+        prefix_feat_embed = torch.cat((ref_feat_embed, zeros_text_feat), dim=1)
+        prefix_combined = prefix_t_mask.unsqueeze(-1) * prefix_text_embed + prefix_a_mask.unsqueeze(-1) * prefix_feat_embed
+
+        enc_pre, base_pre_kv = m.base_lm(inputs_embeds=prefix_combined, is_causal=True)
+        enc_pre = m.fsq_layer(enc_pre) * prefix_a_mask.unsqueeze(-1) + enc_pre * prefix_t_mask.unsqueeze(-1)
+        res_pre_in = m.fusion_concat_proj(torch.cat((enc_pre, prefix_a_mask.unsqueeze(-1) * prefix_feat_embed), dim=-1))
+        _, res_pre_kv = m.residual_lm(inputs_embeds=res_pre_in, is_causal=True)
+
+        snap = {
+            "stable_text_tokens": stable_text_tokens,
+            "n_stable_text": n_stable_text,
+            "prefix_len": prefix_len,
+            "base_pre_kv": [(k.contiguous(), v.contiguous()) for k, v in base_pre_kv],
+            "res_pre_kv": [(k.contiguous(), v.contiguous()) for k, v in res_pre_kv],
+            "prompt_audio_embed": prompt_audio_embed.contiguous(),
+            "last_audio_feat": prompt_audio_gpu[:, -1, ...].contiguous(),
+        }
+        self._prefix_kv_cache[cache_key] = snap
+        return snap
+
     @torch.inference_mode()
     def stream_with_prompt_cache(
         self,
@@ -583,22 +698,85 @@ class _MegaStepRunner:
         # Capture/fetch Mega-Step CUDA graph BEFORE fill_caches so warmup never overwrites live KV!
         g = self._get_or_capture_graph(inference_timesteps, cfg_value)
 
-        # Prefill phase
-        prefill_enc = getattr(m, "_feat_encoder_raw", m.feat_encoder)
-        feat_embed = m.enc_to_lm_proj(prefill_enc(audio_feat))
-        scale_emb = m.config.lm_config.scale_emb if getattr(m.config.lm_config, "use_mup", False) else 1.0
-        text_embed = m.base_lm.embed_tokens(text_token) * scale_emb
-        combined_embed = text_mask.unsqueeze(-1) * text_embed + audio_mask.unsqueeze(-1) * feat_embed
+        # Fast incremental prefill path for ref_continuation (bit-identical causal KV prefix reuse)
+        used_prefix_cache = False
+        if mode == "ref_continuation" and prompt_cache:
+            snap = self._get_or_build_ref_continuation_prefix(prompt_cache)
+            n_stable = snap["n_stable_text"] if snap else 0
+            full_text_tokens = torch.LongTensor(m.text_tokenizer(text))
+            if (
+                snap is not None
+                and full_text_tokens.shape[0] >= n_stable
+                and torch.equal(full_text_tokens[:n_stable], snap["stable_text_tokens"])
+            ):
+                rem_text_tokens = torch.cat(
+                    [
+                        full_text_tokens[n_stable:],
+                        torch.tensor([m.audio_start_token], dtype=torch.int32),
+                    ],
+                    dim=-1,
+                )
+                n_rem_text = int(rem_text_tokens.shape[0])
+                prompt_audio_embed = snap["prompt_audio_embed"]
+                n_prompt_audio = int(prompt_audio_embed.shape[1])
 
-        enc_outputs, kv_cache_tuple = m.base_lm(inputs_embeds=combined_embed, is_causal=True)
-        m.base_lm.kv_cache.fill_caches(kv_cache_tuple)
-        enc_outputs = m.fsq_layer(enc_outputs) * audio_mask.unsqueeze(-1) + enc_outputs * text_mask.unsqueeze(-1)
-        init_lm = enc_outputs[:, -1, :]
+                scale_emb = m.config.lm_config.scale_emb if getattr(m.config.lm_config, "use_mup", False) else 1.0
+                rem_tokens_gpu = torch.cat(
+                    [rem_text_tokens, torch.zeros(n_prompt_audio, dtype=torch.int32)]
+                ).unsqueeze(0).to(device)
+                rem_t_mask = torch.cat(
+                    [torch.ones(n_rem_text, dtype=torch.int32), torch.zeros(n_prompt_audio, dtype=torch.int32)]
+                ).unsqueeze(0).to(device)
+                rem_a_mask = torch.cat(
+                    [torch.zeros(n_rem_text, dtype=torch.int32), torch.ones(n_prompt_audio, dtype=torch.int32)]
+                ).unsqueeze(0).to(device)
 
-        res_in = m.fusion_concat_proj(torch.cat((enc_outputs, audio_mask.unsqueeze(-1) * feat_embed), dim=-1))
-        res_out, res_kv = m.residual_lm(inputs_embeds=res_in, is_causal=True)
-        m.residual_lm.kv_cache.fill_caches(res_kv)
-        init_res = res_out[:, -1, :]
+                rem_text_embed = m.base_lm.embed_tokens(rem_tokens_gpu) * scale_emb
+                zeros_rem_feat = torch.zeros(
+                    (1, n_rem_text, prompt_audio_embed.shape[-1]), device=device, dtype=dtype
+                )
+                rem_feat_embed = torch.cat((zeros_rem_feat, prompt_audio_embed), dim=1)
+                suffix_combined = (
+                    rem_t_mask.unsqueeze(-1) * rem_text_embed
+                    + rem_a_mask.unsqueeze(-1) * rem_feat_embed
+                )
+
+                enc_suf, kv_cache_tuple = self._forward_lm_with_prefix(
+                    m.base_lm, suffix_combined, snap["base_pre_kv"], snap["prefix_len"]
+                )
+                m.base_lm.kv_cache.fill_caches(kv_cache_tuple)
+                enc_suf = m.fsq_layer(enc_suf) * rem_a_mask.unsqueeze(-1) + enc_suf * rem_t_mask.unsqueeze(-1)
+                init_lm = enc_suf[:, -1, :]
+
+                res_suf_in = m.fusion_concat_proj(
+                    torch.cat((enc_suf, rem_a_mask.unsqueeze(-1) * rem_feat_embed), dim=-1)
+                )
+                res_suf_out, res_kv = self._forward_lm_with_prefix(
+                    m.residual_lm, res_suf_in, snap["res_pre_kv"], snap["prefix_len"]
+                )
+                m.residual_lm.kv_cache.fill_caches(res_kv)
+                init_res = res_suf_out[:, -1, :]
+                last_audio_cond = snap["last_audio_feat"]
+                used_prefix_cache = True
+
+        if not used_prefix_cache:
+            # Standard full prefill fallback
+            prefill_enc = getattr(m, "_feat_encoder_raw", m.feat_encoder)
+            feat_embed = m.enc_to_lm_proj(prefill_enc(audio_feat))
+            scale_emb = m.config.lm_config.scale_emb if getattr(m.config.lm_config, "use_mup", False) else 1.0
+            text_embed = m.base_lm.embed_tokens(text_token) * scale_emb
+            combined_embed = text_mask.unsqueeze(-1) * text_embed + audio_mask.unsqueeze(-1) * feat_embed
+
+            enc_outputs, kv_cache_tuple = m.base_lm(inputs_embeds=combined_embed, is_causal=True)
+            m.base_lm.kv_cache.fill_caches(kv_cache_tuple)
+            enc_outputs = m.fsq_layer(enc_outputs) * audio_mask.unsqueeze(-1) + enc_outputs * text_mask.unsqueeze(-1)
+            init_lm = enc_outputs[:, -1, :]
+
+            res_in = m.fusion_concat_proj(torch.cat((enc_outputs, audio_mask.unsqueeze(-1) * feat_embed), dim=-1))
+            res_out, res_kv = m.residual_lm(inputs_embeds=res_in, is_causal=True)
+            m.residual_lm.kv_cache.fill_caches(res_kv)
+            init_res = res_out[:, -1, :]
+            last_audio_cond = audio_feat[:, -1, ...]
 
         # Ensure step budget fits static KV cache
         prefill_len = int(m.base_lm.kv_cache.current_length)
@@ -609,7 +787,7 @@ class _MegaStepRunner:
 
         g["lm_hidden"].copy_(init_lm)
         g["res_hidden"].copy_(init_res)
-        g["prefix_cond"].copy_(audio_feat[:, -1, ...])
+        g["prefix_cond"].copy_(last_audio_cond)
         g["pos_id"].fill_(prefill_len)
         self._vae_graph.reset()
 
