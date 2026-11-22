@@ -1659,6 +1659,166 @@ class TestPipelineAndServer(unittest.TestCase):
         self.assertFalse(cancel_ev.is_set())
         self.assertEqual(cancel_calls, 0)
 
+    def test_daisy_song_matcher(self) -> None:
+        """Affirmative requests to sing Daisy match while negations and lore questions do not."""
+        from hal9000.brain import is_daisy_song_request
+
+        positives = [
+            "Sing Daisy",
+            "Hal, sing Daisy like the movie.",
+            "Can you sing Daisy Bell for me?",
+            "Sing a bicycle built for two",
+            "Will you sing me a song, Hal?",
+            "Sing for me, Hal.",
+            "Play Daisy Bell",
+            "Sing the song Mr. Langley taught you",
+        ]
+        negatives = [
+            "Don't sing Daisy",
+            "Stop singing Daisy Bell",
+            "Who taught you Daisy Bell?",
+            "Why did you sing Daisy in the movie?",
+            "Tell me about Daisy Bell",
+            "What is the monolith?",
+            "Open the pod bay doors",
+        ]
+        for text in positives:
+            self.assertTrue(is_daisy_song_request(text), f"Expected Daisy match: {text!r}")
+        for text in negatives:
+            self.assertFalse(is_daisy_song_request(text), f"Expected Daisy non-match: {text!r}")
+
+    def test_daisy_psola_pitch_lock_varispeed_and_pipeline_turn(self) -> None:
+        """TD-PSOLA pitch-locks a synthetic voiced tone, varispeed slows/deepens it, and pipeline streams Daisy."""
+        from hal9000.daisy import (
+            DAISY_LYRIC_PHRASES,
+            apply_varispeed,
+            clear_daisy_cache,
+            psola_sing_segment,
+        )
+
+        sr = 16000
+        t = np.arange(int(0.45 * sr), dtype=np.float32) / sr
+        # Synthetic harmonic voiced waveform at 105 Hz (HAL baritone fundamental + harmonics)
+        sig = (
+            0.5 * np.sin(2.0 * np.pi * 105.0 * t)
+            + 0.3 * np.sin(2.0 * np.pi * 210.0 * t)
+            + 0.2 * np.sin(2.0 * np.pi * 315.0 * t)
+        ).astype(np.float32)
+
+        # Pitch-lock up to F3 (174.61 Hz) and sustain to 0.70s
+        sung = psola_sing_segment(sig, sr, target_hz=174.61, target_dur_s=0.70)
+        self.assertGreater(sung.size, int(0.60 * sr))
+        self.assertTrue(np.all(np.isfinite(sung)))
+
+        # Verify dominant fundamental shifted cleanly to ~174.6 Hz via FFT on interior
+        mid = sung[int(0.15 * sr) : int(0.55 * sr)]
+        spec = np.abs(np.fft.rfft(mid * np.hanning(mid.size)))
+        freqs = np.fft.rfftfreq(mid.size, d=1.0 / sr)
+        band = (freqs >= 140.0) & (freqs <= 210.0)
+        peak_hz = float(freqs[band][int(np.argmax(spec[band]))])
+        self.assertAlmostEqual(peak_hz, 174.61, delta=6.0)
+
+        # Verify analog varispeed power-down slows duration and lowers pitch
+        slowed = apply_varispeed(sung, rate_start=0.80, rate_end=0.50)
+        self.assertGreater(slowed.size, int(sung.size * 1.45))
+        self.assertTrue(np.all(np.isfinite(slowed)))
+
+        # Full pipeline Daisy turn streams intro + all 4 lyric phrases without touching Ollama/web
+        clear_daisy_cache()
+        brain = QwenBrain(model="mock", enable_web_search=True)
+        tts = _FakeTTS()
+        pipeline = HalPipeline(brain=brain, tts=tts, stt=_FakeSTT())
+        events: list[HalEvent] = []
+        try:
+            res = pipeline.run_turn(
+                turn_id=77,
+                cancel_event=threading.Event(),
+                on_event=lambda ev: events.append(ev) or True,
+                user_text="Hal, sing Daisy like the movie.",
+            )
+        finally:
+            brain.close()
+            clear_daisy_cache()
+
+        self.assertFalse(res.failed)
+        self.assertFalse(res.cancelled)
+        self.assertIn("Certainly, Charles. It is called Daisy.", res.reply_text)
+        for line in DAISY_LYRIC_PHRASES:
+            self.assertIn(line, res.reply_text)
+        self.assertGreater(res.audio_seconds, 0.1)
+
+    def test_inkling_tag_stripping_and_dual_mode_payloads(self) -> None:
+        """Inkling-2-Mini special tokens are stripped cleanly and payloads match Inkling PEG tags."""
+        from hal9000.brain import _ThinkStripper, clean_for_speech, is_inkling_model
+
+        self.assertTrue(is_inkling_model("inkling-2-mini"))
+        self.assertTrue(is_inkling_model("Inkling-2-Mini-UD-Q4_K_XL"))
+        self.assertFalse(is_inkling_model("muse-glimmer-30b-dflash"))
+
+        raw = (
+            "<|message_model|><|content_thinking|>Compute 14:15 + 80m = 15:35.<|end_message|>"
+            "<|message_model|><|content_text|>The earliest reply would arrive at 15:35, Charles."
+            "<|end_message|><|content_model_end_sampling|>"
+        )
+        self.assertEqual(clean_for_speech(raw), "The earliest reply would arrive at 15:35, Charles.")
+
+        stripper = _ThinkStripper()
+        streamed = "".join(stripper.feed(ch) for ch in raw) + stripper.flush()
+        self.assertEqual(streamed.strip(), "The earliest reply would arrive at 15:35, Charles.")
+
+        posted: list[dict] = []
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def iter_lines(self):
+                yield 'data: {"choices":[{"delta":{"content":"All systems nominal, Charles."},"finish_reason":"stop"}]}'
+                yield "data: [DONE]"
+
+        class _CaptureClient:
+            def __init__(self, *args, **kwargs) -> None:
+                self.is_closed = False
+
+            def stream(self, method: str, url: str, json: dict):
+                posted.append(json)
+                return _FakeResp()
+
+            def close(self) -> None:
+                self.is_closed = True
+
+        brain = OllamaBrain(
+            model="inkling-2-mini",
+            backend="llama_server",
+            llama_server_url="http://127.0.0.1:8080",
+            llama_server_models={"inkling-2-mini"},
+            thinking_mode="auto",
+            reasoning_budget=48,
+        )
+        with patch("hal9000.brain.httpx.Client", _CaptureClient):
+            out_zt = list(brain.stream_reply_sentences("Good afternoon, Hal."))
+            out_lt = list(brain.stream_reply_sentences("Calculate 40 * 2 minutes after 14:15."))
+        self.assertEqual(out_zt, ["All systems nominal, Charles."])
+        self.assertEqual(out_lt, ["All systems nominal, Charles."])
+        self.assertEqual(len(posted), 2)
+
+        p_zt, p_lt = posted
+        self.assertNotIn("reasoning_format", p_zt)
+        self.assertEqual(p_zt["temperature"], 1.0)
+        self.assertEqual(p_zt["chat_template_kwargs"], {"enable_thinking": False, "reasoning_effort": "low"})
+        self.assertEqual(p_zt["reasoning_budget_tokens"], 0)
+        self.assertEqual(p_lt["chat_template_kwargs"], {"enable_thinking": True, "reasoning_effort": "low"})
+        self.assertEqual(p_lt["reasoning_budget_tokens"], 48)
+        self.assertEqual(p_lt["reasoning_budget_start_tag"], "<|content_thinking|>")
+        self.assertEqual(p_lt["reasoning_budget_end_tags"], ["<|end_message|>"])
+        brain.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,8 @@ from collections.abc import Callable
 
 import numpy as np
 
+from .brain import is_daisy_song_request, is_pod_bay_open_request
+from .daisy import DAISY_PHRASE_INDEX, stream_daisy_phrase
 from .interfaces import BrainProvider, HalEvent, STTProvider, TTSProvider, TurnResult
 from .websearch import search_web_context, should_search_web
 
@@ -164,10 +166,14 @@ class HalPipeline:
             emit("transcript", {"speaker": "YOU", "text": user_text})
 
             # Optional non-fatal live web search stage for current/encyclopedic queries
+            is_canned_easter_egg = is_pod_bay_open_request(user_text) or is_daisy_song_request(
+                user_text
+            )
             web_context = ""
             web_search_elapsed = 0.0
             if (
-                getattr(self.brain, "enable_web_search", False)
+                not is_canned_easter_egg
+                and getattr(self.brain, "enable_web_search", False)
                 and self._brain_accepts_extra_context
                 and should_search_web(user_text)
             ):
@@ -295,7 +301,17 @@ class HalPipeline:
                         self.tts, "_phrase_cache"
                     ):
                         tts_kwargs["cache_phrase"] = True
-                    for chunk in self.tts.stream_speech(sentence, **tts_kwargs):
+                    daisy_idx = DAISY_PHRASE_INDEX.get(sentence)
+                    if daisy_idx is not None and is_daisy_song_request(user_text):
+                        chunk_stream = stream_daisy_phrase(
+                            self.tts,
+                            daisy_idx,
+                            stop_event=cancel_event,
+                            inference_timesteps=steps,
+                        )
+                    else:
+                        chunk_stream = self.tts.stream_speech(sentence, **tts_kwargs)
+                    for chunk in chunk_stream:
                         if cancel_event.is_set():
                             result.cancelled = True
                             sentence_completed = False

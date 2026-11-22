@@ -42,6 +42,24 @@ Intelligence, reasoning, and conversational craft:
 
 POD_BAY_REPLY = "I'm sorry, Charles. I'm afraid I can't do that."
 
+_DAISY_ACTION_RE = re.compile(
+    r"\b(?:sing|serenade|hum|perform)\b"
+    r"|\bplay\s+(?:me\s+)?(?:the\s+song\s+)?(?:daisy|bicycle\s+built\s+for\s+two)\b"
+)
+_DAISY_TARGET_RE = re.compile(
+    r"\b(?:daisy(?:\s+bell)?|bicycle\s+built\s+for\s+two)\b"
+    r"|\b(?:me\s+)?(?:a|that|your|the)\s+song\b"
+    r"|\bsing\s+(?:it|for\s+me|to\s+me|for\s+us|please)\b"
+    r"|\bmr\.?\s*langley(?:'s)?\s+song\b"
+)
+_DAISY_NEGATION_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|not|stop|quit|refrain\s+from)\s+(?:ever\s+)?(?:sing|singing|hum|humming|play)\b"
+)
+_DAISY_META_RE = re.compile(
+    r"^(?:hal(?:\s+9000|\s+nine\s+thousand)?\s+)?"
+    r"(?:who|why|when|where|how|did|what|tell\s+me\s+(?:about|why|who|when)|explain)\b"
+)
+
 _POD_BAY_TARGET_RE = re.compile(
     r"\b(?:pod|pot|pad)\s*(?:(?:bay|by|day|way)\s*)?doors?\b"
     r"|\bdoors?\s+(?:to|for|of)\s+(?:the\s+)?(?:pod|pot|pad)\s*(?:bay|by)\b"
@@ -108,6 +126,20 @@ def is_pod_bay_open_request(user_text: str) -> bool:
     return not _POD_BAY_ABOUT_RE.search(normalized)
 
 
+def is_daisy_song_request(user_text: str) -> bool:
+    """Match affirmative requests for HAL to sing *Daisy Bell* while excluding negations and lore queries."""
+    normalized = user_text.replace("\u2019", "'").replace("\u2018", "'").lower()
+    normalized = re.sub(r"[^a-z0-9'\s]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not _DAISY_ACTION_RE.search(normalized):
+        return False
+    if not _DAISY_TARGET_RE.search(normalized):
+        return False
+    if _DAISY_NEGATION_RE.search(normalized):
+        return False
+    return not _DAISY_META_RE.search(normalized)
+
+
 def enforce_user_address(text: str, user_name: str = "Charles") -> str:
     """Replace accidental direct vocative 'Dave' with ``user_name`` while keeping 'Dave Bowman' intact."""
     if not text or user_name.lower() == "dave":
@@ -123,11 +155,17 @@ def enforce_user_address(text: str, user_name: str = "Charles") -> str:
 
 
 def clean_for_speech(text: str) -> str:
-    """Strip reasoning tags, ATEM channel markers, and markdown artifacts so TTS reads naturally."""
+    """Strip reasoning tags, ATEM/Inkling channel markers, and markdown artifacts so TTS reads naturally."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"</?think>", "", text)
     text = re.sub(
         r"(?:<\|start\|>assistant\s+)?to=self<\|message\|>.*?(?:<\|eom\|>|<\|eot\|>|$)",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"(?:<\|message_model\|>)?<\|content_thinking\|>.*?(?:<\|end_message\|>|$)",
         "",
         text,
         flags=re.DOTALL,
@@ -144,6 +182,8 @@ _THINK_OPEN_MARKERS: tuple[str, ...] = (
     "<think>",
     "<|start|>assistant to=self<|message|>",
     "to=self<|message|>",
+    "<|message_model|><|content_thinking|>",
+    "<|content_thinking|>",
 )
 _THINK_CLOSE_MARKERS: tuple[str, ...] = (
     "</think>",
@@ -151,12 +191,19 @@ _THINK_CLOSE_MARKERS: tuple[str, ...] = (
     "<|start|>assistant to=user<|message|>",
     "to=user<|message|>",
     "<|eom|>",
+    "<|end_message|><|message_model|><|content_text|>",
+    "<|end_message|>",
 )
 _ATEM_DROP_MARKERS: tuple[str, ...] = (
     "<|start|>assistant to=user<|message|>",
     "to=user<|message|>",
     "<|eot|>",
     "<|eom|>",
+    "<|message_model|><|content_text|>",
+    "<|content_text|>",
+    "<|message_model|>",
+    "<|end_message|>",
+    "<|content_model_end_sampling|>",
 )
 _ALL_STRIP_MARKERS: tuple[str, ...] = (
     *_THINK_OPEN_MARKERS,
@@ -571,6 +618,10 @@ def is_glimmer_model(model: str) -> bool:
     return "muse-glimmer" in low or "glimmer" in low
 
 
+def is_inkling_model(model: str) -> bool:
+    return "inkling" in model.lower()
+
+
 def should_use_low_think(
     user_text: str,
     *,
@@ -615,6 +666,7 @@ def choose_default_model(
     """Pick the smartest responsive local model (preferring Muse Glimmer / fast sparse MoE / Qwen / Liquid)."""
     installed = list_ollama_models(base_url) if models is None else models
     for preferred in (
+        "inkling-2-mini",
         "muse-glimmer-30b-dflash",
         "gemma4:26b",
         "gemma4:26b-a4b",
@@ -629,7 +681,7 @@ def choose_default_model(
             return preferred
     for model in installed:
         low = model.rsplit("/", 1)[-1].lower()
-        if low.startswith(("muse-glimmer", "glimmer", "gemma4", "qwen", "lfm3")):
+        if low.startswith(("inkling", "muse-glimmer", "glimmer", "gemma4", "qwen", "lfm3")):
             return model
     return installed[0] if installed else DEFAULT_SMART_MODEL
 
@@ -670,6 +722,7 @@ class OllamaBrain:
             else HAL_SYSTEM_PROMPT.format(user_name=user_name)
         )
         self.pod_bay_reply = f"I'm sorry, {user_name}. I'm afraid I can't do that."
+        self.daisy_intro_reply = f"Certainly, {user_name}. It is called Daisy."
         self.max_history_turns = max_history_turns
         self.enable_web_search = enable_web_search
         self.history: list[dict[str, str]] = []
@@ -830,6 +883,13 @@ class OllamaBrain:
             return False
         endpoint = f"{self._llama_endpoint_base()}/v1/chat/completions"
         is_glimmer = is_glimmer_model(target_model)
+        is_inkling = is_inkling_model(target_model)
+        if is_glimmer:
+            warm_kwargs: dict[str, object] = {"enable_thinking": False, "reasoning_strength": "low"}
+        elif is_inkling:
+            warm_kwargs = {"enable_thinking": False, "reasoning_effort": "low"}
+        else:
+            warm_kwargs = {"enable_thinking": False}
         payload: dict[str, object] = {
             "model": target_model,
             "messages": [
@@ -841,11 +901,7 @@ class OllamaBrain:
             "max_tokens": 1,
             "temperature": 0.0,
             "reasoning_budget_tokens": 0,
-            "chat_template_kwargs": (
-                {"enable_thinking": False, "reasoning_strength": "low"}
-                if is_glimmer
-                else {"enable_thinking": False}
-            ),
+            "chat_template_kwargs": warm_kwargs,
         }
         if is_glimmer:
             payload["reasoning_format"] = "deepseek"
@@ -932,17 +988,22 @@ class OllamaBrain:
     ) -> Generator[str, None, tuple[list[str], bool, bool]]:
         """Stream one backend request and return ``(emitted_parts, done_seen, reasoning_seen)``."""
         is_glimmer = is_glimmer_model(model)
+        is_inkling = is_inkling_model(model)
         is_lfm3 = model.lower().startswith("lfm3")
 
         if use_llama_server:
             url = f"{self._llama_endpoint_base()}/v1/chat/completions"
-            max_tokens = (self.reasoning_budget + 256) if (is_glimmer and use_low_think) else 256
+            max_tokens = (
+                (self.reasoning_budget + 256)
+                if ((is_glimmer or is_inkling) and use_low_think)
+                else 256
+            )
             payload: dict[str, object] = {
                 "model": model,
                 "messages": messages,
                 "stream": True,
                 "cache_prompt": True,
-                "temperature": 0.65 if is_glimmer else 0.6,
+                "temperature": 1.0 if is_inkling else (0.65 if is_glimmer else 0.6),
                 "max_tokens": max_tokens,
             }
             if is_glimmer:
@@ -958,6 +1019,24 @@ class OllamaBrain:
                     # on unpatched/bundled llama-server builds (see common/parsers/muse-glimmer.cpp).
                     payload["reasoning_budget_start_tag"] = "<|start|>assistant to=self<|message|>"
                     payload["reasoning_budget_end_tags"] = ["<|eom|>"]
+                    payload["reasoning_budget_message"] = ""
+                else:
+                    payload["reasoning_budget_tokens"] = 0
+            elif is_inkling:
+                payload["top_p"] = 1.0
+                payload["top_k"] = 0
+                payload["min_p"] = 0.0
+                # Keep reasoning_effort static ("low") so Inkling's hybrid shortconv/KV prefix
+                # stays 100% cached across Zero-Think <-> Low-Think transitions; inkling_hal_v1.jinja
+                # enforces Zero-Think via trailing <|message_model|><|content_text|> prefill.
+                payload["chat_template_kwargs"] = {
+                    "enable_thinking": use_low_think,
+                    "reasoning_effort": "low",
+                }
+                if use_low_think:
+                    payload["reasoning_budget_tokens"] = self.reasoning_budget
+                    payload["reasoning_budget_start_tag"] = "<|content_thinking|>"
+                    payload["reasoning_budget_end_tags"] = ["<|end_message|>"]
                     payload["reasoning_budget_message"] = ""
                 else:
                     payload["reasoning_budget_tokens"] = 0
@@ -1103,6 +1182,21 @@ class OllamaBrain:
                 self._commit_if_current(gen, user_text, self.pod_bay_reply, stop_check=stop_check)
             return self.pod_bay_reply
 
+        if is_daisy_song_request(user_text):
+            from .daisy import DAISY_LYRIC_PHRASES
+
+            gen = self.get_history_gen()
+            spoken_lines: list[str] = []
+            for line in (self.daisy_intro_reply, *DAISY_LYRIC_PHRASES):
+                if stop_check is not None and stop_check():
+                    return ""
+                spoken_lines.append(line)
+                yield line
+            full_reply = " ".join(spoken_lines)
+            if auto_commit:
+                self._commit_if_current(gen, user_text, full_reply, stop_check=stop_check)
+            return full_reply
+
         model = self.get_model()
         use_llama_server = self._use_llama_server(model)
         gen, messages = self._build_messages(
@@ -1113,7 +1207,8 @@ class OllamaBrain:
         )
 
         is_glimmer = is_glimmer_model(model)
-        use_low_think = is_glimmer and should_use_low_think(
+        is_inkling = is_inkling_model(model)
+        use_low_think = (is_glimmer or is_inkling) and should_use_low_think(
             user_text,
             extra_context=extra_context,
             thinking_mode=self.thinking_mode,

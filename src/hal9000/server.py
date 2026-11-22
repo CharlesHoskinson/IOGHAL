@@ -35,6 +35,7 @@ from .brain import (
     OllamaBrain,
     choose_default_model,
     is_glimmer_model,
+    is_inkling_model,
     list_llama_server_models,
     list_ollama_models,
 )
@@ -451,6 +452,18 @@ class HalRuntime:
                     if not self.llama_server_url:
                         return
                     sys_prompt = HAL_SYSTEM_PROMPT.format(user_name=self.config.user_name)
+                    if is_glimmer_model(target_model):
+                        warm_kwargs: dict[str, Any] = {
+                            "enable_thinking": False,
+                            "reasoning_strength": "low",
+                        }
+                    elif is_inkling_model(target_model):
+                        warm_kwargs = {
+                            "enable_thinking": False,
+                            "reasoning_effort": "low",
+                        }
+                    else:
+                        warm_kwargs = {"enable_thinking": False}
                     warm_payload: dict[str, Any] = {
                         "model": target_model,
                         "messages": [
@@ -462,11 +475,7 @@ class HalRuntime:
                         "max_tokens": 1,
                         "temperature": 0.0,
                         "reasoning_budget_tokens": 0,
-                        "chat_template_kwargs": (
-                            {"enable_thinking": False, "reasoning_strength": "low"}
-                            if is_glimmer_model(target_model)
-                            else {"enable_thinking": False}
-                        ),
+                        "chat_template_kwargs": warm_kwargs,
                     }
                     if is_glimmer_model(target_model):
                         warm_payload["reasoning_format"] = "deepseek"
